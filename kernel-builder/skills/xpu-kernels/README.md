@@ -1,29 +1,35 @@
 # XPU Kernels Skill
 
-This skill was adapted from [Xe-Forge](https://github.com/IntelLabs/Xe-Forge) — an LLM-driven optimization framework that transforms PyTorch code into fast Triton kernels for Intel XPU GPUs.
+Guidance, tools and a knowledge base for writing and optimizing **Triton**, **SYCL** and
+**SYCL-TLA** (CUTLASS for SYCL) kernels on Intel XPU GPUs, and for
+shipping them with kernel-builder. Start with [SKILL.md](SKILL.md).
 
-The skill includes Xe-Forge's CLI tools (`scripts/`), knowledge base (`references/`), and the optimization workflow, all integrated into the hf-kernels skill format.
+The methodology, scripts and knowledge base are adapted from
+[Xe-Forge](https://github.com/IntelLabs/Xe-Forge), an LLM-driven multi-stage kernel
+optimizer for Intel GPUs. The knowledge base in `references/` mirrors Xe-Forge's
+`knowledge_base/` (`triton/xpu` → `references/`, `common` → `references/common/`,
+`sycl/xpu` → `references/sycl/`), edited to refer to this skill's tools.
+Last synced with Xe-Forge commit `8f84e39`.
 
-## Full Experience
+## Full Xe-Forge
 
-For the complete Xe-Forge setup — including the ai-bench harness, test kernels, GEMM/reduction templates, annotated examples, and VTune profiling — clone the full project:
+For the fully automated pipeline (DSPy and Claude Code engines, CUTLASS SYCL tile search,
+optimizing kernels inside an existing repository, framework capture):
 
 ```bash
-# Clone the repository
 git clone https://github.com/IntelLabs/Xe-Forge
 cd Xe-Forge
-
-# Install for Intel XPU
 uv sync --extra intel
 ```
 
 ## Prerequisites
 
 - Python 3.10+
-- PyTorch with XPU support
-- [Intel XPU Backend for Triton](https://github.com/intel/intel-xpu-backend-for-triton)
-- Intel XPU hardware (tested on Battlemage G21 / Arc Pro B50)
-- Intel VTune Profiler 2025+ *(optional — set `vtune_enabled: false` in `scripts/config.yaml` to skip)*
+- PyTorch with XPU support (2.8+ for SYCL `load_inline` trials)
+- Triton: the [Intel XPU Backend for Triton](https://github.com/intel/intel-xpu-backend-for-triton) matching your PyTorch
+- SYCL / SYCL-TLA: the oneAPI DPC++ compiler (`icpx`) environment sourced; [SYCL-TLA](https://github.com/intel/sycl-tla) headers for CuTe/CUTLASS kernels
+- An Intel XPU visible to PyTorch (`python scripts/xpu_device_info.py` reports what is present; the skill assumes no specific model)
+- Optional profilers: [unitrace](https://github.com/intel/pti-gpu/tree/master/tools/unitrace) and/or Intel VTune Profiler 2025+ (toggle in `scripts/config.yaml`)
 
 ## Install Dependencies
 

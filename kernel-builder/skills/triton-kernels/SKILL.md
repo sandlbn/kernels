@@ -531,7 +531,7 @@ rocprof --stats python your_kernel.py
 ### Backend-Specific Skills
 
 - [rocm-kernels](../rocm-kernels/SKILL.md) — AMD MI355X / R9700 tuning, ROCm constraints
-- [xpu-kernels](../xpu-kernels/SKILL.md) — Intel XPU Triton tuning
+- [xpu-kernels](../xpu-kernels/SKILL.md) — Intel XPU Triton, SYCL and SYCL-TLA kernels
 
 ### External Resources
 

@@ -453,7 +453,7 @@ cpu-kernels/
 - [Hugging Face Kernels](https://github.com/huggingface/kernels) — Kernel hub and builder CLI
 - [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/)
 - [kernel-builder Documentation](https://github.com/huggingface/kernels/tree/main/docs)
-- [xpu-kernels skill](../xpu-kernels/SKILL.md) — the Intel XPU Triton skill this workflow was adapted from
+- [xpu-kernels skill](../xpu-kernels/SKILL.md) — the Intel XPU (Triton, SYCL, SYCL-TLA) skill this workflow was adapted from
 - [Xe-Forge](https://github.com/IntelLabs/Xe-Forge) — the LLM-driven optimization framework the skill methodology originates from
 
 ## Acknowledgments

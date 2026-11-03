@@ -9,6 +9,8 @@ _DEFAULTS = {
     "max_trials": 10,
     "vtune_enabled": True,
     "vtune_bin": "/bin64/vtune",
+    "unitrace_enabled": False,
+    "unitrace_bin": "unitrace",
 }
 
 

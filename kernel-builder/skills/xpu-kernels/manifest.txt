@@ -1,6 +1,10 @@
 # Files for xpu-kernels skill
 SKILL.md
 README.md
+references/algorithmic_patterns.yaml
+references/autotuning_patterns.yaml
+references/common/algorithmic_patterns.yaml
+references/common/correctness.yaml
 references/correctness.yaml
 references/dtype_optimizations.yaml
 references/fusion_patterns.yaml
@@ -11,6 +15,11 @@ references/memory_patterns.yaml
 references/optimization_levels.yaml
 references/optimization_strategies.md
 references/persistent_kernel_patterns.yaml
+references/sycl/compute_basic.yaml
+references/sycl/cutlass_sycl_framework.yaml
+references/sycl/resource_feedback.yaml
+references/sycl/sycl-implementation.md
+references/sycl/sycl_tla_patterns.yaml
 references/workflow_details.md
 references/xpu_optimizations.yaml
 scripts/analyze_kernel.py
@@ -22,5 +31,7 @@ scripts/huggingface_kernels_example.py
 scripts/requirements.txt
 scripts/transformers_injection_example.py
 scripts/trial_manager.py
+scripts/validate_sycl.py
 scripts/validate_triton.py
+scripts/xpu_device_info.py
 scripts/xpu_profiler.py

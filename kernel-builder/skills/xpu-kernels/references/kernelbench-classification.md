@@ -138,21 +138,21 @@ Full models requiring multiple kernel types. Decompose into Level 1 operators.
 | **Attention** | `attention-skill.md` (planned) | P2 - High complexity |
 | **Fused** | `fused-skill.md` (planned) | P2 - Combination patterns |
 
-## Performance Expectations by Category
+## Difficulty by Category
 
-Based on kernel-agent test results:
+| Category | Difficulty | Notes |
+|----------|------------|-------|
+| Elementwise | Low | Large blocks, memory-bound |
+| Reduction (sum/mean) | Medium | Good parallelism |
+| Pooling | Medium | Grid mapping challenge |
+| LayerNorm/RMSNorm | Medium | Row-wise reduction |
+| Dense GEMM | High | Tile swizzle critical |
+| Batched GEMM | High | Often memory-bandwidth limited |
+| BatchNorm | Very High | Statistics/synchronization handling |
+| Argmax/Argmin | Very High | Triton API limitations |
+| Fused operators | Very High | Correctness challenges |
 
-| Category | Achievable Speedup | Difficulty | Notes |
-|----------|-------------------|------------|-------|
-| Elementwise | 1.0-3.0x | Low | Large blocks, memory-bound |
-| Reduction (sum/mean) | 1.5-5.0x | Medium | Good parallelism |
-| Pooling | 1.5-5.0x | Medium | Grid mapping challenge |
-| LayerNorm/RMSNorm | 1.5-2.0x | Medium | Row-wise reduction |
-| Dense GEMM | 0.8-1.2x | High | Tile swizzle critical |
-| Batched GEMM | 0.6-0.9x | High | Memory bandwidth limited |
-| BatchNorm | <0.1x | Very High | HIP sync issues |
-| Argmax/Argmin | FAIL | Very High | Triton API limitation |
-| Fused operators | 0.3-1.0x | Very High | Correctness challenges |
+Achievable speedups depend on the workload and device: measure them.
 
 ## Recommended Skill Development Order
 

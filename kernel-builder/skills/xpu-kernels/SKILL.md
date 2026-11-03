@@ -1,314 +1,443 @@
 ---
 name: xpu-kernels
-description: "Provides guidance for writing, optimizing, and benchmarking Triton kernels for Intel XPU GPUs (Battlemage/Arc Pro B50) using the Xe-Forge optimization framework. Includes an LLM-driven trial-loop workflow (analyze, validate, benchmark, profile, finalize), XPU-specific patterns (tensor descriptors, GRF mode, tile swizzling), KernelBench fused kernels, and Flash Attention."
+description: "Provides guidance for writing, optimizing, and benchmarking Triton, SYCL, and SYCL-TLA (CUTLASS for SYCL) kernels for Intel XPU GPUs in the Hugging Face kernels ecosystem, without assuming a specific GPU model (the device is queried through PyTorch). Includes a branching trial-loop workflow (analyze, validate, benchmark, profile, finalize), an Intel XPU knowledge base (tensor descriptors, GRF mode, tile swizzling, DPAS/XMX tiling, SLM, sub-group collectives, epilogue fusion), unitrace/VTune profiling guidance, and porting to kernel-builder (cpp-xpu) projects."
 disable-model-invocation: false
 user-invocable: true
 allowed-tools: "Read, Grep, Glob, Bash"
-argument-hint: "kernel type: gemm, reduction, flash-attention, optimize, benchmark, tensor-descriptors, xe-forge"
+argument-hint: "kernel type: gemm, attention, flash-attention, rmsnorm, softmax, reduction, fused-epilogue, moe, triton, sycl, sycl-tla, cutlass, optimize, benchmark, profile, tensor-descriptors"
 ---
 
-# XPU Triton Kernels for Intel GPUs
+# XPU Kernels for Intel GPUs (Triton, SYCL, SYCL-TLA)
 
-This skill provides patterns and guidance for developing optimized Triton kernels targeting Intel XPU GPUs (Battlemage/Arc Pro B50). It integrates the [Xe-Forge](https://github.com/IntelLabs/Xe-Forge) optimization framework — an LLM-driven loop that transforms PyTorch code into fast Triton kernels.
+This skill provides patterns and a repeatable optimization workflow for developing fast,
+numerically equivalent kernels for Intel XPU GPUs. Kernels are written in one of three ways:
+
+- **Triton** with the [Intel XPU backend](https://github.com/intel/intel-xpu-backend-for-triton) — fastest iteration; the default for fused elementwise/reduction/GEMM-epilogue/attention work.
+- **SYCL** (DPC++) — explicit control over work-groups, sub-groups, SLM and vectorization.
+- **SYCL-TLA** ([CUTLASS for SYCL](https://github.com/intel/sycl-tla), CuTe) — library collectives for DPAS/XMX GEMM, grouped/MoE GEMM, flash attention and epilogue fusion.
+
+The methodology and knowledge base are adapted from [Xe-Forge](https://github.com/IntelLabs/Xe-Forge) (see [Acknowledgments](#acknowledgments)).
+
+## Key Concepts (read before the Quick Start)
+
+- **Trial** — one candidate implementation (`t<N>.py`), saved into a branching tree by `scripts/trial_manager.py`. Every trial is validated, benchmarked and recorded.
+- **Baseline** — the PyTorch reference (`*_pytorch.py`, KernelBench-style `Model` + `get_inputs()` + `get_init_inputs()`) or an existing kernel (`--triton-baseline`). Every trial must match it numerically.
+- **Trial form vs. shipping form** — trials are self-contained Python files (Triton, or SYCL compiled with `load_inline`) so a single harness can measure them; the winner is then ported to a kernel-builder project (`torch-noarch` for Triton, `cpp-xpu` for SYCL/SYCL-TLA).
+- **Single XPU** — GPU work (benchmark, profiling) runs strictly one at a time.
+- **No hardware assumptions** — the skill does not assume a GPU model. Query the device (`scripts/xpu_device_info.py`) and derive every hardware-dependent choice from what it reports; measure everything else.
 
 ## Quick Start
 
-### Optimize a Kernel (Xe-Forge Workflow)
-
-The full optimization workflow analyzes a PyTorch baseline, generates Triton kernel variants in a branching trial tree, benchmarks each on XPU hardware, and finalizes the best result.
-
 ```bash
-# 1. Analyze the baseline
-python scripts/analyze_kernel.py test_kernels/70_Gemm_Sigmoid_Scaling_ResidualAdd_pytorch.py
+# 0. Query the device, pick the DSL (see "Choosing a DSL"), read scripts/config.yaml
+python scripts/xpu_device_info.py
+
+# 1. Analyze the PyTorch baseline
+python scripts/analyze_kernel.py my_op_pytorch.py
 
 # 2. Initialize trial tracking
-python scripts/trial_manager.py init 70_Gemm_Sigmoid test_kernels/70_Gemm_Sigmoid_Scaling_ResidualAdd_pytorch.py
+python scripts/trial_manager.py init my_op my_op_pytorch.py
 
-# 3. Validate a generated kernel (no GPU needed)
-python scripts/validate_triton.py my_kernel.py
+# 3. Validate a generated trial (no GPU needed)
+python scripts/validate_triton.py t0.py        # Triton
+python scripts/validate_sycl.py   t0.py        # SYCL / SYCL-TLA (load_inline trial)
 
-# 4. Benchmark correctness + performance
-python scripts/benchmark.py test_kernels/70_Gemm_Sigmoid_Scaling_ResidualAdd_pytorch.py my_kernel.py
+# 4. Save, then benchmark correctness + performance
+python scripts/trial_manager.py save my_op t0.py --strategy "baseline port"
+python scripts/benchmark.py my_op_pytorch.py t0.py
 
-# 5. Profile with VTune (optional)
-python scripts/xpu_profiler.py my_kernel.py
+# 5. Profile (optional, one job at a time)
+python scripts/xpu_profiler.py t0.py           # VTune
+# or unitrace for SYCL — see references/sycl/sycl-implementation.md#profiling-sycl-kernels
 
-# 6. Finalize best trial
-python scripts/trial_manager.py finalize 70_Gemm_Sigmoid optimized_triton.py
+# 6. Finalize the best trial
+python scripts/trial_manager.py finalize my_op my_op_optimized.py
 ```
 
-## Supported Hardware
+## Device Discovery
 
-| GPU | Architecture | XVEs | Mem BW | Key Feature | Verified |
-|-----|-------------|------|--------|-------------|:--------:|
-| **Battlemage G21 / Arc Pro B50** | Xe2 | 128 | ~500 GB/s | Tensor descriptors, GRF 256 | Yes |
+The skill makes **no claims about specific GPUs**. Before writing a kernel, query the device
+that is actually present:
 
-> See the [Intel XPU Backend for Triton](https://github.com/intel/intel-xpu-backend-for-triton) for supported hardware.
+```bash
+python scripts/xpu_device_info.py          # or --json
+```
+
+```python
+import torch
+props = torch.xpu.get_device_properties(torch.xpu.current_device())
+print(torch.xpu.get_device_name(), props)  # name, gpu_subslice_count, sub_group_sizes, has_fp64, ...
+print(torch.xpu.get_arch_list())           # AOT targets this PyTorch build supports
+```
+
+Derive hardware-dependent choices from the result, never from a GPU name or a remembered number:
+
+| Decision | Source |
+|----------|--------|
+| Persistent / Stream-K program count | `gpu_subslice_count` (`xpu_hardware_subslice_query`) |
+| SYCL sub-group size, Triton warp size candidates | `sub_group_sizes` |
+| Work-group size limits | `max_work_group_size`, `max_num_sub_groups` |
+| SLM staging budget | per-work-group local memory limit reported by the device / runtime |
+| Matrix (DPAS/XMX) and 2D block I/O paths | `has_subgroup_matrix_multiply_accumulate`, `has_subgroup_2d_block_io` |
+| fp64 / bf16 / 64-bit atomics | `has_fp64`, `has_bfloat16_conversions`, `has_atomic64` |
+| `TORCH_XPU_ARCH_LIST` for SYCL trials | the `torch.xpu.get_arch_list()` entry matching this device |
+| Peak bandwidth / FLOPS, roofline | **not reported** — measure on the device; never assume |
+
+Properties a given PyTorch build does not expose are **unknown**, not defaults.
 
 ## When This Skill Applies
 
 Use this skill when:
-- Optimizing PyTorch operations into Triton kernels for **Intel XPU**
-- Writing GEMM, fused kernels, reductions, or Flash Attention for Intel GPUs
-- Running the **Xe-Forge optimization loop** (analyze → validate → benchmark → profile → finalize)
-- Benchmarking kernel performance against PyTorch baseline on XPU
+- Writing or optimizing **Triton, SYCL, or SYCL-TLA** kernels for **Intel XPU**
+- Converting PyTorch operations (GEMM, fused epilogues, normalization, softmax, attention, MoE) into fast XPU kernels
+- Running the **trial-loop optimization** (analyze → validate → benchmark → profile → finalize)
+- Profiling XPU kernels with **unitrace** or **VTune** and turning counters into the next experiment
+- Packaging an XPU kernel with **kernel-builder** and publishing it to the Hugging Face Hub
 
-## Xe-Forge Optimization Workflow
+## Choosing a DSL
 
-Transform PyTorch code into optimized Triton kernels for Intel XPU. Kernels must be numerically equivalent and faster than baseline.
+| Workload | Recommended | Why |
+|----------|-------------|-----|
+| Elementwise / activation / normalization / softmax / reductions | **Triton** (or plain SYCL) | Simple to write; Triton autotune covers the shape space |
+| GEMM + light epilogue, fused KernelBench-style ops | **Triton** first | Tensor descriptors + `grf_mode` + swizzling reach the roofline on many shapes |
+| Large BF16/FP16 GEMM, grouped/MoE GEMM, W4A16/W8A16 GEMM | **SYCL-TLA** | Library DPAS mainloops, 2D block copies, Stream-K / group schedulers |
+| Flash attention (prefill/decode/paged) | **Triton** or **SYCL-TLA** | Triton for broad shape sets; SYCL-TLA FA2 collectives for fixed head dims |
+| Explicit sub-group / SLM control, existing SYCL code base | **SYCL** | Direct `nd_range`, sub-group collectives, `local_accessor` |
 
-### Configuration — Read `config.yaml` first
+You can mix: e.g. a SYCL-TLA GEMM followed by a Triton reduction. Keep each trial a single
+self-contained file.
 
-At the start of every session, read `scripts/config.yaml`. It controls:
-- **`max_trials`** — hard cap on optimization trials; always run all of them (use this instead of hardcoded "10")
-- **`vtune_enabled`** — if `false`, skip ALL VTune profiling steps (Step 3.6 and profiler-related decisions)
-- **`vtune_bin`** — path to the VTune binary (also settable via `VTUNE_BIN` env var)
+## Optimization Workflow
 
-### Rules — Never Violate
+### Configuration — read `scripts/config.yaml` first
 
-1. **ONLY create** Triton kernel files (`test_kernels/*_triton.py` or trial files `t<trial_id>.py`).
-2. **NEVER create** benchmark scripts, test scripts, helper utilities, or any other Python files.
-3. **NEVER write custom scripts** to measure performance or test correctness — ONLY use `scripts/benchmark.py`.
-4. If a tool fails, **STOP and report the error**. Do NOT work around it with custom scripts.
-5. Generated kernels must be **self-contained** — all helper functions inline.
-6. You **MUST run all `max_trials` trials** from `config.yaml`. Do NOT stop early due to plateau — LLM sampling can discover new ideas at any point. The only valid early stop is speedup > 5x.
+- **`max_trials`** — hard cap on optimization trials; run all of them
+- **`vtune_enabled`** / **`vtune_bin`** — VTune profiling (`VTUNE_BIN` env var also works)
+- **`unitrace_enabled`** / **`unitrace_bin`** — unitrace profiling (preferred for SYCL when available)
 
-### Mandatory Tools
+### Rules — never violate
 
-**CRITICAL — Single-XPU serialization**: There is only ONE XPU on this machine. You MUST NOT run multiple GPU workloads in parallel. `benchmark.py` and `xpu_profiler.py` must execute strictly one at a time — concurrent GPU jobs produce wrong results. CPU-only tools (`analyze_kernel.py`, `validate_triton.py`, `trial_manager.py`) are safe to parallelize with each other and with anything else.
+1. **Only create kernel files** — trial files `t<N>.py` and the final output file.
+2. **Never create** benchmark scripts, test scripts or helper utilities.
+3. **Never write custom timing code** — `scripts/benchmark.py` is the only source of a timing. A number obtained any other way (including from an instrumented profiling run) is not comparable and must not be recorded.
+4. A **correctness failure rejects the candidate**, not the session: use the diagnostic, fix the trial, and re-run the mandatory tools. Never time or rank a failing candidate. For **infrastructure failures** (driver, compiler, harness), stop and report the error — do not work around it.
+5. Trials are **self-contained**: helpers inline; copy `get_inputs()`, `get_init_inputs()` and constants from the reference instead of importing them.
+6. **Run all `max_trials`**. Do not stop on a plateau — try a structurally different approach. The only valid early stop is speedup > 5x.
+7. **SYCL trials:** submit to PyTorch's queue, namespace every kernel name per trial, and pin `TORCH_XPU_ARCH_LIST` (see [sycl-implementation.md](references/sycl/sycl-implementation.md#hard-rules)).
+
+### Mandatory tools
+
+**Single-XPU serialization**: `benchmark.py`, `xpu_profiler.py` and unitrace runs must execute one at a time. CPU-only tools (`analyze_kernel.py`, `validate_*.py`, `trial_manager.py`) can run in parallel.
 
 | Tool | Command | Purpose |
 |------|---------|---------|
-| **Analyze** | `python scripts/analyze_kernel.py <file>` | Static analysis: operations, shapes, fusion opportunities |
-| **Validate** | `python scripts/validate_triton.py <file>` | Syntax + constraint checks before GPU time |
-| **Benchmark** | `python scripts/benchmark.py <baseline> <triton> [--triton-baseline] [--baseline-us <cached>]` | Correctness + performance via ai-bench |
-| **Profile** | `python scripts/xpu_profiler.py <file>` | VTune GPU hardware counters + recommendations |
-| **Init trials** | `python scripts/trial_manager.py init <kernel_name> <baseline_file> [--triton-baseline]` | Initialize trial tracking |
-| **Save trial** | `python scripts/trial_manager.py save <kernel_name> <file> [--parent <parent_id>] [--strategy "..."]` | Save trial to tree |
-| **Record result** | `python scripts/trial_manager.py result <kernel_name> <trial_id> --validation pass --correctness <pass\|fail> --speedup <float> --baseline_us <float> --triton_us <float>` | Record benchmark result |
-| **Check status** | `python scripts/trial_manager.py status <kernel_name>` | View trial tree |
-| **Best trial** | `python scripts/trial_manager.py best <kernel_name>` | Get best trial |
-| **Baseline time** | `python scripts/trial_manager.py baseline-us <kernel_name>` | Cached baseline time for `--baseline-us` |
-| **Finalize** | `python scripts/trial_manager.py finalize <kernel_name> <name>_triton.py` | Copy best trial to output |
+| **Device info** | `python scripts/xpu_device_info.py [--json]` | Name, properties, AOT targets of the present XPU |
+| **Analyze** | `python scripts/analyze_kernel.py <pytorch_file>` | Operations, shapes, fusion opportunities |
+| **Validate (Triton)** | `python scripts/validate_triton.py <file>` | Syntax + XPU Triton constraint checks |
+| **Validate (SYCL)** | `python scripts/validate_sycl.py <trial.py \| kernel.cpp \| dir>` | Queue, sub-group, kernel-name, binding checks |
+| **Benchmark** | `python scripts/benchmark.py <baseline> <trial> [--triton-baseline] [--baseline-us <cached>]` | Correctness + performance via ai-bench (any DSL exposing `Model`) |
+| **Profile** | `python scripts/xpu_profiler.py <file>` | VTune GPU counters + KB-grounded recommendations |
+| **Init / save / result** | `python scripts/trial_manager.py {init,save,result} ...` | Trial tree management |
+| **Status / best / baseline-us** | `python scripts/trial_manager.py {status,best,baseline-us} <kernel_name>` | Inspect the tree, cached baseline time |
+| **Finalize** | `python scripts/trial_manager.py finalize <kernel_name> <output_file>` | Copy best trial to the output |
 
-### Workflow Steps
+Full arguments: [workflow_details.md](references/workflow_details.md).
+
+### Steps
 
 #### Step 1: Analyze
-- Read the baseline source file. Identify shapes, dtypes, operations, fusion opportunities.
-- If baseline is PyTorch: run `python scripts/analyze_kernel.py <pytorch_file>`.
-- If baseline is Triton (`--triton-baseline`): skip `analyze_kernel.py` (it only supports PyTorch). Read the Triton file directly.
-- Read relevant knowledge base files: start with `references/correctness.yaml` and `references/xpu_optimizations.yaml`.
-- Read `references/implementation_reference.md` for templates and the Model class pattern.
+- Read the baseline; identify shapes, dtypes, operations, fusion opportunities, and whether the problem is compute- or memory-bound (FLOPs vs. bytes).
+- PyTorch baseline: run `analyze_kernel.py`. Existing-kernel baseline (`--triton-baseline`): read it directly.
+- Read the knowledge base for the chosen DSL (tables below). Always start with the correctness files.
 
 #### Step 2: Initialize
 ```bash
 python scripts/trial_manager.py init <kernel_name> <baseline_file> [--triton-baseline]
 ```
 
-#### Step 3: Trial Loop (always run all `max_trials` from config.yaml)
-For each trial:
-1. **Write kernel** — start from templates or modify previous trial. See `references/implementation_reference.md`.
-2. **Validate** — `python scripts/validate_triton.py <triton_file>` (fix until passing; doesn't count as a trial).
-3. **Save** — `python scripts/trial_manager.py save <kernel_name> <triton_file> --parent <parent_id> --strategy "description"`. Omit `--parent` for the first trial (t0).
-4. **Benchmark** (MANDATORY every trial):
-   - **Trial t0:** `python scripts/benchmark.py <baseline_file> <triton_file> [--triton-baseline]` (measures both baseline and triton).
-   - **Trials t1+:** Get cached baseline via `python scripts/trial_manager.py baseline-us <kernel_name>`, then run `python scripts/benchmark.py <baseline_file> <triton_file> [--triton-baseline] --baseline-us <cached_value>` (skips baseline perf, saves time).
-   - **After `finalize`:** Re-run `benchmark.py` without `--baseline-us` for final accurate comparison.
-5. **Record** — `python scripts/trial_manager.py result <kernel_name> <trial_id> --validation pass --correctness <pass|fail> --speedup <float> --baseline_us <float> --triton_us <float>` (runtimes from benchmark output).
-6. **Profile (MANDATORY after t1, if `vtune_enabled` is true in config.yaml)** — Run `python scripts/xpu_profiler.py <triton_file>` after your first benchmarked trial. Use its output to guide subsequent trial strategies. Run again if speedup plateaus after 2+ additional trials. **Skip this step entirely if `vtune_enabled` is false.**
-7. **Decide next action** (use profiler output from step 6 to inform decisions):
-   - Speedup > 5x → stop (excellent), finalize
-   - Speedup improved → continue on this branch, try next optimization level
-   - Speedup regressed → branch back to best trial, try different strategy
-   - Correctness failed → fix on same branch
-   - Profiler says low occupancy (if vtune_enabled) → increase tile sizes, check `references/xpu_optimizations.yaml`
-   - Profiler says overhead kernels dominate (if vtune_enabled) → pre-pack to bf16, see `references/optimization_levels.yaml`
-   - Plateau → do NOT stop. Try a fundamentally different approach (different algorithm, tiling, fusion strategy). LLM sampling can discover new ideas.
-   - See `references/optimization_strategies.md` for the full "try harder" decision tree
+#### Step 3: Trial loop (all `max_trials`)
+1. **Write** — start from a template ([implementation_reference.md](references/implementation_reference.md) for Triton, [sycl-implementation.md](references/sycl/sycl-implementation.md) for SYCL/SYCL-TLA) or modify the parent trial.
+2. **Validate** — `validate_triton.py` / `validate_sycl.py`; fix until passing (does not count as a trial).
+3. **Save** — `trial_manager.py save <kernel_name> t<N>.py --parent <id> --strategy "..."` (omit `--parent` for t0).
+4. **Benchmark** (every trial):
+   - t0: `benchmark.py <baseline> t0.py` (measures both).
+   - t1+: `benchmark.py <baseline> t<N>.py --baseline-us $(python scripts/trial_manager.py baseline-us <kernel_name>)`.
+   - After finalize: rerun without `--baseline-us` for the final comparison.
+5. **Record** — `trial_manager.py result <kernel_name> <id> --validation pass --correctness <pass|fail> --speedup <x> --baseline_us <us> --triton_us <us>`.
+6. **Profile** after t1 (if enabled) and again on a plateau. Reason as **observation → hypothesis → one change → expected counter change → benchmark result**; cite the counter and the profile directory.
+7. **Decide**:
+   - Speedup > 5x → finalize.
+   - Improved → continue on this branch; apply the next optimization level ([optimization_levels.yaml](references/optimization_levels.yaml)).
+   - Regressed → branch from the best trial with a different strategy.
+   - Correctness failed → fix on the same branch.
+   - Plateau → structurally different approach (algorithm, tiling, fusion boundary, or DSL). See [optimization_strategies.md](references/optimization_strategies.md).
 
-#### Step 4: Finalize
+#### Step 4: Finalize and ship
 ```bash
-python scripts/trial_manager.py finalize <kernel_name> <name>_triton.py
+python scripts/trial_manager.py finalize <kernel_name> <output_file>
 ```
+Then port to kernel-builder ([Building and Shipping](#building-and-shipping)).
 
-### Reference Docs — Read During Step 1
+## Reference Docs
+
+### Read first (all DSLs)
 
 | Doc | Contents |
 |-----|----------|
-| `references/implementation_reference.md` | Code templates, Model class pattern, GEMM example |
-| `references/optimization_strategies.md` | Strategy reference, optimization levels, checklist |
-| `references/workflow_details.md` | Detailed workflow, decision tree, benchmarking/validation details |
-| `references/correctness.yaml` | Critical constraints to avoid bugs |
-| `references/xpu_optimizations.yaml` | XPU-specific patterns (tensor descriptors, GRF, swizzling) |
-| `references/fusion_patterns.yaml` | When to fuse vs split operations |
-| `references/optimization_levels.yaml` | Progressive optimization with "try harder" decision tree |
+| [common/correctness.yaml](references/common/correctness.yaml) | DSL-independent correctness: harness ownership, dtype/rounding contracts |
+| [common/algorithmic_patterns.yaml](references/common/algorithmic_patterns.yaml) | DSL-independent algebraic rewrites |
+| [workflow_details.md](references/workflow_details.md) | Detailed trial loop, tool arguments, profiler output |
+| [kernelbench-classification.md](references/kernelbench-classification.md) | KernelBench operator taxonomy |
 
-### Existing Baselines Are Naive
+### Triton
 
-The `test_kernels/*.py` Triton files (non-pytorch) are **unoptimized baselines**. They use manual pointer arithmetic, lack autotune, and miss XPU optimizations. Do NOT copy their patterns. Use `references/implementation_reference.md` instead.
+| Doc | Contents |
+|-----|----------|
+| [correctness.yaml](references/correctness.yaml) | Triton-on-XPU hard constraints |
+| [xpu_optimizations.yaml](references/xpu_optimizations.yaml) | Tensor descriptors, GRF mode, warps, swizzling, spill-aware pruning, exp2 tricks |
+| [autotuning_patterns.yaml](references/autotuning_patterns.yaml) | Autotune config spaces, keys, pruning |
+| [memory_patterns.yaml](references/memory_patterns.yaml) | Descriptor rules, liveness, pre-packing, atomics |
+| [fusion_patterns.yaml](references/fusion_patterns.yaml) | When to fuse vs. split |
+| [dtype_optimizations.yaml](references/dtype_optimizations.yaml) | bf16/fp16 I/O, fp32 accumulation, fp64 avoidance |
+| [algorithmic_patterns.yaml](references/algorithmic_patterns.yaml) | Triton-specific algorithmic rewrites |
+| [persistent_kernel_patterns.yaml](references/persistent_kernel_patterns.yaml) | Persistent kernels, Stream-K |
+| [optimization_levels.yaml](references/optimization_levels.yaml) | Progressive L1→L4 checklist + "try harder" tree |
+| [optimization_strategies.md](references/optimization_strategies.md) | Strategy reference and checklist |
+| [implementation_reference.md](references/implementation_reference.md) | Templates, Model wrapper pattern |
 
-## Core XPU Kernel Patterns
+### SYCL / SYCL-TLA
 
-### Tensor Descriptors (Preferred on XPU)
+| Doc | Contents |
+|-----|----------|
+| [sycl/sycl-implementation.md](references/sycl/sycl-implementation.md) | Trial (`load_inline`) and kernel-builder templates, SYCL-TLA GEMM skeleton, unitrace profiling |
+| [sycl/sycl_tla_patterns.yaml](references/sycl/sycl_tla_patterns.yaml) | Constraints/patterns: sub-group + MMA, SLM, reductions, online softmax, FA recurrence, epilogues, quantization |
+| [sycl/cutlass_sycl_framework.yaml](references/sycl/cutlass_sycl_framework.yaml) | SYCL-TLA tile configs, dispatch policies, schedulers, epilogue catalog, fused kernels |
+| [sycl/resource_feedback.yaml](references/sycl/resource_feedback.yaml) | Reading kernel properties (SIMD, SLM, spill, GRF) |
+| [sycl/compute_basic.yaml](references/sycl/compute_basic.yaml) | unitrace ComputeBasic / EU-stall collection and interpretation |
 
-Tensor descriptors produce better address generation and memory access codegen than block pointers on Intel XPU.
+## Core Triton Patterns
+
+### Tensor descriptors (required; block pointers are deprecated)
 
 ```python
 desc = tl.make_tensor_descriptor(
-    base=ptr, shape=[M, N],
-    strides=[stride_m, stride_n],
-    block_shape=[BLOCK_M, BLOCK_N],
+    base=a_ptr, shape=[M, K], strides=[stride_am, stride_ak], block_shape=[BLOCK_M, BLOCK_K],
 )
-block = tl.load(desc, [pid_m, pid_n], boundary_check=(0, 1))
+a = desc.load([pid_m * BLOCK_M, k])   # element offsets; out-of-bounds is handled by the descriptor
 ```
 
-### GRF Mode '256'
+- `tl.make_block_ptr` / `tl.advance` are deprecated — do not use them in new kernels.
+- Descriptor `.load()` takes no `boundary_check`/`mask`.
+- 2D block I/O needs the contiguous dimension and row stride to be multiples of 16 elements and a 16-byte-aligned base; otherwise loads silently fall back to gathers (`descriptor_2d_block_io_alignment`).
 
-Use the large register file for compute-heavy kernels:
+### GRF mode (tune, do not assume)
 
 ```python
 @triton.autotune(
-    configs=[triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256}, num_warps=32)],
-    key=['M', 'N', 'K'],
+    configs=[
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 32, "grf_mode": "256"}, num_warps=32, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "grf_mode": "256"}, num_warps=16, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "grf_mode": "128"}, num_warps=4,  num_stages=4),
+    ],
+    key=["M", "N", "K"],
 )
-@triton.jit(launch_metadata=lambda *args, **kwargs: {'grf_mode': '256'})
-def kernel(...):
+@triton.jit
+def kernel(..., BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
     ...
 ```
 
-### Register-Spill-Aware Autotune Pruning
+Put both GRF modes in the autotune space (`grf_mode_both_variants_in_autotune`) and sweep `num_warps` — never hard-code 32 warps.
 
-For autotuned XPU kernels, prune configs that are likely to spill even after large-GRF recompilation. This avoids slow double-compile/benchmark cycles where the Intel backend reports spills, recompiles in large GRF mode, and still spills.
+### Register-spill-aware autotune pruning
 
-Use an `early_config_prune` that estimates per-thread GRF pressure from the live accumulator and operand tiles:
+Prune configs likely to spill even in large-GRF mode with an `early_config_prune` estimator:
 
 ```text
-regs ~= (accumulators * BM * BN + stages * (BM * BK + weight_tiles * BN * BK))
-        / (num_warps * warp_size)
+regs ~= (accumulators * BM * BN + stages * (BM * BK + weight_tiles * BN * BK)) / (num_warps * warp_size)
 ```
 
-Guidelines:
-- Apply this only on XPU; leave other backends' configs unchanged.
-- Read `BM`, `BN`, and `BK` from either autotune config kwargs or launch args.
-- Count accumulator tiles explicitly: gate/up fused kernels often have 2 accumulators, down/simple GEMM usually has 1.
-- Count weight tiles explicitly: gate/up fused kernels often load 2 weight tiles, down/simple GEMM usually loads 1.
-- Use `num_stages` for pipelined MMA paths; use 1 for scalar/non-pipelined paths.
-- Keep a never-empty fallback, such as the config with the lowest estimated register pressure.
-- Treat the model as a coarse filter for catastrophic spillers, not a perfect predictor; leave borderline configs for real benchmarking.
+Apply only on XPU, count accumulators/weight tiles explicitly (gate/up fused kernels often have 2), keep a never-empty fallback, and treat it as a coarse filter. Pattern: `xpu_register_spill_autotune_pruning` in [xpu_optimizations.yaml](references/xpu_optimizations.yaml).
 
-This complements `grf_mode='256'`: large GRF increases the register budget, while pruning removes configs that are still too register-heavy to be useful.
-
-For an implementation pattern, see `references/xpu_optimizations.yaml (xpu_register_spill_autotune_pruning)`.
-
-### Tile Swizzling
-
-Use 1D grid with GROUP_SIZE_M for L2 locality:
+### Tile swizzling (1D grid)
 
 ```python
-grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-# Inside kernel:
+grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
 pid = tl.program_id(0)
-num_pid_n = tl.cdiv(N, BLOCK_N)
+num_pid_m = tl.cdiv(M, BLOCK_M); num_pid_n = tl.cdiv(N, BLOCK_N)
 group_id = pid // (GROUP_SIZE_M * num_pid_n)
+first_pid_m = group_id * GROUP_SIZE_M
+group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+pid_m = first_pid_m + (pid % group_size_m)
+pid_n = (pid % (GROUP_SIZE_M * num_pid_n)) // group_size_m
 ```
 
-### bf16 Inputs with fp32 Accumulation
+### bf16/fp16 I/O with fp32 accumulation
 
 ```python
-a = tl.load(a_desc, [pid_m, k], boundary_check=(0, 1))
-b = tl.load(b_desc, [k, pid_n], boundary_check=(0, 1))
-acc += tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16), acc=acc)  # fp32 accumulator
+acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+for k in range(0, K, BLOCK_K):
+    acc = tl.dot(a_desc.load([off_m, k]), b_desc.load([k, off_n]), acc)
+c_desc.store([off_m, off_n], acc.to(tl.bfloat16))
 ```
 
-## Critical XPU Constraints
+Pre-pack weights (transpose/cast) once, not per forward (`xpu_pack_weight_transpose_once`, `xpu_cache_packed_transposes`). Use `exp2`-based sigmoid/tanh/softmax scaling on XPU.
 
-- **NO default values** for `@triton.autotune` meta-parameters in kernel signature
-- **1D grid** when using tile swizzling (GROUP_SIZE_M)
-- **`boundary_check`** uses dimension indices `(0, 1)`, not booleans
-- **Cast batch indices** to `int64` before stride multiplication
-- **Prefer tensor descriptors** over block pointers for all new XPU kernels
-- **Do NOT mix** block pointer and tensor descriptor APIs on same operation
-- **Pre-zero output buffers** when using atomic accumulation
-- Model class must be compatible with ai-bench (`nn.Module` with `nn.Linear`)
-- Match `get_inputs()`, `get_init_inputs()`, and module-level constants from `*_pytorch.py`
+## Core SYCL / SYCL-TLA Patterns
 
-> Full constraint list: [correctness.yaml](references/correctness.yaml)
+Full templates: [sycl-implementation.md](references/sycl/sycl-implementation.md).
 
-## Performance Results
+### Launch on PyTorch's queue with a pinned sub-group size
 
-Measured on Intel Battlemage G21 / Arc Pro B50 (128 XVEs). All runtimes are median of benchmark trials.
+```cpp
+namespace my_op_t3 {               // unique per trial
+template <typename T> class MyKernel;
+}
 
-### KernelBench Level 2 — Fused Kernels (bf16)
+sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+q.parallel_for<my_op_t3::MyKernel<T>>(
+    sycl::nd_range<1>(rows * WG, WG),
+    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {   // SG from sub_group_sizes
+      // fp32 accumulation; work-group collective when the work-group owns the row
+      float s = sycl::reduce_over_group(it.get_group(), partial, sycl::plus<float>());
+      ...
+    });
+// no q.wait()
+```
 
-Speedup is vs. PyTorch eager baseline. Includes GEMM+Sigmoid+Scaling, GEMM+GELU+Softmax, Conv+BatchNorm+ReLU, and other fused patterns.
+### SYCL-TLA GEMM building blocks
 
-### Flash Attention Forward (fp16)
+```cpp
+using TileShape = Shape<_256, _256, _32>;                                  // work-group tile
+using TiledMma  = typename TiledMMAHelper<MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
+                    Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+using GmemTiledCopyA = XE_2D_U16x32x32_LD_N;                               // 2D block loads
+using GmemTiledCopyB = XE_2D_U16x32x32_LD_V;
+using DispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<2>;             // or MainloopXeL1Staged
+// CollectiveMma -> GemmUniversal -> GemmUniversalAdapter; check can_implement() first
+```
 
-Baseline is the flash attention kernel from the Intel XPU Triton backend; speedup is vs. that kernel across multiple sequence lengths.
+Tune in this order: TileShape/sub-group layout → dispatch policy → pipeline stages/prefetch → tile scheduler (Persistent / Stream-K / Group) → epilogue fusion. Starting configs and their caveats: [cutlass_sycl_framework.yaml](references/sycl/cutlass_sycl_framework.yaml).
 
-> Full results: see the [Xe-Forge repository](https://github.com/IntelLabs/Xe-Forge).
+### Things that change numerics — keep the reference contract
+
+- Activation identity and approximation mode (exact vs. tanh GELU; SiLU ≠ GELU) — `sycl_epilogue_sigmoid_gelu_silu`
+- Quantization: scale/zero-point semantics, rounding then saturation before integer conversion — `sycl_quantized_gemm_epilogue`
+- Online softmax / flash attention: rescale both running sum **and** output when the max changes; handle fully masked rows — `sycl_flash_attention_tiling`
+- Split-K / independent accumulators reorder fp additions — validate tolerances
+
+## Critical Constraints
+
+**Triton**
+- No default values for `@triton.autotune` meta-parameters in the kernel signature
+- 1D grid whenever GROUP_SIZE_M swizzling is used
+- Tensor descriptors only; no block pointers; no `boundary_check` on descriptor loads
+- Cast batch/offset indices to `int64` before stride multiplication on large tensors
+- Pre-zero outputs used with atomic accumulation
+- Never autotune `BLOCK_D` (the reduction/head dimension) — use `triton.next_power_of_2(D)`
+
+**SYCL / SYCL-TLA**
+- PyTorch's queue only; no per-call `sycl::queue`, no `wait()` in the op
+- Unique namespace for kernel names per trial; `TORCH_XPU_ARCH_LIST` set from the queried device
+- `[[sycl::reqd_sub_group_size(N)]]` matching the MMA atom / collectives used
+- Sub-group reductions only when one sub-group owns the whole reduction
+- SLM budget = stages × tile bytes + padding + other local allocations ≤ per-work-group limit
+- SYCL-TLA: verify template arguments against the installed revision; `can_implement()` before `run()`
+
+**All**
+- `Model` must mirror the reference's `__init__` parameters so weights can be copied; match `get_inputs()` / `get_init_inputs()`
+- No device→host syncs (`.item()`, `.cpu()`) in `forward()`
+
+> Full lists: [correctness.yaml](references/correctness.yaml), [common/correctness.yaml](references/common/correctness.yaml), [sycl_tla_patterns.yaml](references/sycl/sycl_tla_patterns.yaml) (`constraints:`)
+
+## Performance Profiling
+
+| Tool | Use for | How |
+|------|---------|-----|
+| **unitrace** (Intel PTI) | Device timing, ComputeBasic counters, EU stall sampling, kernel properties (SIMD, SLM, spill, GRF) | `unitrace --device-timing --metric-sampling --group ComputeBasic -o <dir>/trace python scripts/benchmark.py ...` |
+| **VTune** | XVE active/stalled/idle, occupancy limiters, cache hierarchy, KB-grounded recommendations | `python scripts/xpu_profiler.py <trial>` |
+
+- Run `unitrace --metric-list` first; available groups depend on device, driver, metrics library and permissions. Missing counters are **unknown**, not zero.
+- Profiler timings are never results — only uninstrumented `benchmark.py` numbers are recorded.
+- Kernel properties are driver-reported allocations; spill memory size is not spill traffic. High occupancy does not imply efficiency; high `SbidStall` does not by itself prove DRAM saturation.
+
+Details: [compute_basic.yaml](references/sycl/compute_basic.yaml), [resource_feedback.yaml](references/sycl/resource_feedback.yaml), [workflow_details.md](references/workflow_details.md#profiling).
+
+## Building and Shipping
+
+Scaffold with kernel-builder and move the winning trial's code into it:
+
+```bash
+kernel-builder init --name my-org/my-kernel --backends xpu
+```
+
+| Trial DSL | `build.toml` | Notes |
+|-----------|--------------|-------|
+| Triton | `[torch-noarch]` section, Python package in `torch-ext/<name>/` | See `examples/kernels/relu-triton` |
+| SYCL | `[kernel.<name>]` with `language = "cpp-xpu"`, `depends = ["torch"]` | See `examples/kernels/relu` (`relu_xpu/`) |
+| SYCL-TLA | `language = "cpp-xpu"`, `depends = ["torch", "sycl_tla"]` | See `examples/kernels/cutlass-gemm` |
+
+- Bind C++ ops with `TORCH_LIBRARY_EXPAND` + `ops.impl(..., torch::kXPU, &fn)`; no pybind11, no `setup.py`, no `load_inline` in shipped code.
+- Extra SYCL compiler flags go in `sycl-flags` — only when really needed.
+- Build: `nix run .#build-and-copy -L` (or `kernel-builder build`); test: `nix run .#ci-test`; publish: `kernel-builder build-and-upload`.
+
+Porting checklist and binding template: [sycl-implementation.md](references/sycl/sycl-implementation.md#porting-a-trial-to-kernel-builder). Hub loading and library integration: [huggingface-kernels-integration.md](references/huggingface-kernels-integration.md).
 
 ## Common Issues
 
 | Issue | Symptom | Fix |
 |-------|---------|-----|
-| **Autotune BLOCK_D** | Wrong results (max_abs 4-8+) | **Never autotune BLOCK_D.** Use `triton.next_power_of_2(D)` |
-| Python min/max | Runtime error | `tl.minimum()`/`tl.maximum()` |
+| Autotuned `BLOCK_D` | Large numerical mismatch vs. reference | Fix `BLOCK_D = triton.next_power_of_2(D)` |
+| Python `min`/`max` in kernel | Compile/runtime error | `tl.minimum()` / `tl.maximum()` |
+| Descriptor loads slow | No `ttig.block_io` in TTGIR | Align base to 16 B and contiguous dim/stride to 16 elements |
+| Autotune takes forever | Many configs spill and recompile | Spill-aware `early_config_prune` |
+| SYCL trial slower than expected | JIT from generic SPIR-V | Set `TORCH_XPU_ARCH_LIST` to this device's entry from `xpu_device_info.py` before `load_inline` |
+| Wrong results only when baseline and trial run together | Kernel name collision across extensions | Unique namespace per trial |
+| Out-of-order / stale results in SYCL op | Private `sycl::queue` | Use `c10::xpu::getCurrentXPUStream().queue()` |
+| Partial-row results in SYCL reduction | Sub-group reduce on a work-group-owned row | Work-group collective, or one sub-group per row |
+| SYCL-TLA build errors after toolchain bump | Template signature changed | Check declarations in the installed sycl-tla revision |
+| No ComputeBasic counters | Metrics library / permissions | `unitrace --metric-list`; ask an admin about `observation_paranoid` — never change it silently |
 
 ## Project Structure
 
 ```
 xpu-kernels/
-├── SKILL.md                                    # This file (skill definition + workflow)
-├── manifest.txt                                # Files included in this skill
-│
-├── scripts/                                    # Standalone CLI tools
-│   ├── analyze_kernel.py                       # PyTorch → operations, shapes, fusion opportunities
-│   ├── validate_triton.py                      # Syntax + constraint checks
-│   ├── benchmark.py                            # Correctness + performance via ai-bench
-│   ├── trial_manager.py                        # Tree-structured trial management
-│   ├── xpu_profiler.py                         # VTune GPU hardware counters
-│   ├── config.py                               # Shared configuration loader
-│   ├── config.yaml                             # Session config (max_trials, vtune)
-│   └── requirements.txt                        # Python dependencies
-│
-└── references/                                 # Knowledge base + integration guides
-    ├── correctness.yaml                        # Hard constraints for XPU Triton
-    ├── xpu_optimizations.yaml                  # Tensor descriptors, GRF, swizzling
-    ├── implementation_reference.md             # Code templates, Model class pattern
-    ├── implementation_reference.md             # Code templates, Model class pattern
-    ├── optimization_strategies.md              # Strategy reference + "try harder" tree
-    ├── optimization_levels.yaml                # Progressive L1-L5 optimization levels
-    ├── workflow_details.md                     # Detailed workflow and decision tree
-    ├── fusion_patterns.yaml                    # When to fuse vs split
-    ├── memory_patterns.yaml                    # Access patterns and coalescing
-    ├── dtype_optimizations.yaml                # Mixed precision choices
-    ├── persistent_kernel_patterns.yaml         # Stream K and persistent kernels
-    ├── kernel-templates.md                     # Triton kernel templates for XPU
-    └── kernelbench-classification.md           # KernelBench operator taxonomy
+├── SKILL.md                         # This file
+├── README.md
+├── manifest.txt                     # Files installed by `kernel-builder skills add`
+├── scripts/
+│   ├── analyze_kernel.py            # PyTorch → operations, shapes, fusion opportunities
+│   ├── validate_triton.py           # Triton static checks
+│   ├── validate_sycl.py             # SYCL / SYCL-TLA static checks
+│   ├── benchmark.py                 # Correctness + performance via ai-bench
+│   ├── benchmark_kernels.py         # Micro-benchmarks: RMSNorm, RoPE 3D, GEGLU, AdaLN (Triton)
+│   ├── trial_manager.py             # Branching trial tree
+│   ├── xpu_profiler.py              # VTune counters + recommendations
+│   ├── xpu_device_info.py           # Query the present XPU through PyTorch
+│   ├── config.py / config.yaml      # Session configuration
+│   ├── huggingface_kernels_example.py
+│   ├── transformers_injection_example.py
+│   └── requirements.txt
+└── references/
+    ├── common/                      # DSL-independent correctness + algorithmic patterns
+    ├── sycl/                        # SYCL / SYCL-TLA knowledge base + implementation guide
+    ├── *.yaml, *.md                 # Triton-on-XPU knowledge base
+    ├── workflow_details.md
+    ├── huggingface-kernels-integration.md
+    └── kernelbench-classification.md
 ```
 
 ## See Also
 
-### Xe-Forge Tools
-- [analyze_kernel.py](scripts/analyze_kernel.py) — Static analysis of PyTorch reference
-- [validate_triton.py](scripts/validate_triton.py) — Pre-benchmark constraint checks
-- [benchmark.py](scripts/benchmark.py) — Correctness + performance measurement
-- [xpu_profiler.py](scripts/xpu_profiler.py) — VTune GPU hardware counters
-- [trial_manager.py](scripts/trial_manager.py) — Branching trial tree management
-
-### XPU Optimization References
-- [correctness.yaml](references/correctness.yaml) — Critical constraints
-- [xpu_optimizations.yaml](references/xpu_optimizations.yaml) — Tensor descriptors, GRF, swizzling
-- [optimization_strategies.md](references/optimization_strategies.md) — Strategy reference
-- [optimization_levels.yaml](references/optimization_levels.yaml) — Progressive L1-L5 levels
-- [implementation_reference.md](references/implementation_reference.md) — Code templates
-
-### Other References
-- [kernelbench-classification.md](references/kernelbench-classification.md) — KernelBench operator taxonomy
-
-### External Resources
-- [Xe-Forge Repository](https://github.com/IntelLabs/Xe-Forge)
-- [AI-Bench](https://github.com/libxsmm/AI-bench) — Benchmark harness for correctness + performance
+- [triton-kernels](../triton-kernels/SKILL.md) — portable Triton patterns (NVIDIA/AMD)
+- [cuda-kernels](../cuda-kernels/SKILL.md), [rocm-kernels](../rocm-kernels/SKILL.md), [cpu-kernels](../cpu-kernels/SKILL.md) — other backends
 - [Intel XPU Backend for Triton](https://github.com/intel/intel-xpu-backend-for-triton)
-- [Triton Language Guide](https://triton-lang.org/)
+- [SYCL-TLA (CUTLASS for SYCL)](https://github.com/intel/sycl-tla)
+- [oneAPI DPC++ / SYCL](https://github.com/intel/llvm) and the [SYCL 2020 specification](https://registry.khronos.org/SYCL/)
+- [unitrace (Intel PTI)](https://github.com/intel/pti-gpu/tree/master/tools/unitrace)
+- [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels) — production SYCL/SYCL-TLA kernels referenced by the knowledge base
+- [AI-Bench](https://github.com/libxsmm/AI-bench) — benchmark harness used by `scripts/benchmark.py`
+- [Xe-Forge](https://github.com/IntelLabs/Xe-Forge) — fully automated multi-stage optimizer (DSPy and Claude Code engines, tile search, kernel-repo mode)
+
+## Acknowledgments
+
+The methodology, scripts and knowledge base of this skill were contributed by Intel AI researchers from the IntelLabs team behind [Xe-Forge](https://github.com/IntelLabs/Xe-Forge) and are kept in sync with its `knowledge_base/` (Triton, common and SYCL sections).

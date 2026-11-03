@@ -1,13 +1,11 @@
 # Kernel Fusion Patterns for Intel XPU
 # Fusion can reduce memory traffic by eliminating intermediate writes/reads,
-# but it can also hurt due to GRF/register pressure, reduced occupancy, and
-# losing access to vendor-tuned primitives (e.g., GEMM).
+# but it can also hurt due to GRF/register pressure, reduced occupancy.
 #
 # Guidance:
 # - Fuse bandwidth-bound elementwise chains aggressively (usually a win).
 # - Be cautious fusing into GEMM unless you already need a custom GEMM.
-# - Do NOT fuse if the intermediate is not materialized, is dead/redundant,
-#   or if fusion would replace a faster vendor primitive for a tiny epilogue.
+# - Do NOT fuse if the intermediate is not materialized or dead/redundant.
 
 constraints:
   - id: fuse_only_if_intermediate_is_materialized
@@ -23,17 +21,190 @@ constraints:
       - dead / provably redundant for the workload,
       then fusion provides little/no benefit and may harm performance.
 
-  - id: do_not_replace_vendor_gemm_for_tiny_epilogue
-    name: "Do not replace vendor GEMM solely to fuse a tiny epilogue"
+  - id: prefer_fused_gemm_with_epilogue
+    name: "Prefer fused GEMM with epilogue over separate kernels"
     severity: critical
     description: |
-      If a vendor GEMM path exists and is faster, do not implement a custom Triton GEMM
-      only to fuse a small epilogue (e.g., ReLU / min-sub / clamp).
+      When a GEMM is followed by a small epilogue (e.g., ReLU, bias add, clamp),
+      fuse the epilogue into the GEMM kernel by applying it on the accumulator
+      in registers before the final tl.store. This eliminates an extra read+write
+      of the full output tensor.
 
-      Prefer:
-      - vendor GEMM + separate epilogue kernel, OR
-      - vendor GEMM with native epilogue (if supported),
-      unless the epilogue is substantial OR you must use a custom GEMM due to layout/math.
+      However, if the epilogue is very complex (e.g., GroupNorm, BatchNorm with
+      running stats, reductions across spatial dims), keep it as a separate kernel
+      to avoid register pressure collapse.
+
+  - id: nhwc_spatially_tiled_conv_with_tensor_descriptors
+    name: "Spatially-tiled NHWC convolution using tensor descriptors and fused epilogue"
+    severity: critical
+    description: |
+      For convolution kernels, use NHWC (channels_last) layout with SPATIAL TILING
+      and ALL operands via tl.make_tensor_descriptor. This is the only Triton conv pattern
+      that reliably maps to DPAS on Intel XPU.
+
+      There are THREE things that must ALL be correct:
+
+      1. NHWC LAYOUT — C must be the contiguous (stride=1) dimension.
+         Convert once: x.to(memory_format=torch.channels_last)
+         Weight packed as HWIO: weight.permute(2, 3, 1, 0).contiguous()
+
+      2. SPATIAL TILING — grid is (n, oh, ow_tile * cout_tile), NOT flat M.
+         Preserving (n, oh) in the grid ensures that within each tile,
+         output pixels along ow are consecutive in NHWC flat (N*H*W, C) view.
+         This makes x loads a regular 2D block — enabling a descriptor.
+         Flattening M = N*OH*OW DESTROYS this — adjacent M indices cross
+         oh/batch boundaries, forcing scatter loads that break DPAS.
+
+      3. ALL OPERANDS USE tensor descriptors (x, w, y) — descriptor loads/stores
+         generate Intel 2D block load/store instructions (SubgroupBlockReadINTEL).
+         This replaces ALL scatter/gather with structured block transfers.
+
+      WRONG patterns (all break DPAS):
+      - NCHW direct conv: C not contiguous, no GEMM possible
+      - im2col: flattens K_h*K_w*C_in, scatter-gather indices → scalar FMA fallback
+      - Flat M tiling: M=N*OH*OW with pointer arithmetic → scatter x loads
+
+      CORRECT pattern — spatially-tiled NHWC conv:
+      ```python
+      @triton.jit
+      def _conv2d_spatial_tiled(
+          x_ptr, w_ptr, bias_ptr, y_ptr,
+          N_batch, H, W, C_out, OH, OW,
+          stride_wkh, stride_wkw, stride_wci, stride_wco,
+          BLOCK_OW: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+          KH: tl.constexpr, KW: tl.constexpr, C_IN: tl.constexpr,
+      ):
+          n = tl.program_id(0)
+          oh = tl.program_id(1)
+          pid_ow_n = tl.program_id(2)  # combined ow_tile and cout_tile
+
+          num_ow_tiles = tl.cdiv(OW, BLOCK_OW)
+          pid_ow = pid_ow_n % num_ow_tiles
+          pid_n = pid_ow_n // num_ow_tiles
+          ow0 = pid_ow * BLOCK_OW
+          HW = H * W
+
+          acc = tl.zeros((BLOCK_OW, BLOCK_N), dtype=tl.float32)
+
+          # K_h × K_w small GEMMs — each on contiguous NHWC data
+          for kh in range(KH):
+              for kw in range(KW):
+                  # x rows: consecutive in flat (N*H*W, C_IN) view
+                  x_row_start = n * HW + (oh + kh) * W + (ow0 + kw)
+                  x_valid_rows = W - (ow0 + kw)  # rows past this h-row are out of bounds
+
+                  x_desc = tl.make_tensor_descriptor(
+                      base=x_ptr,
+                      shape=(x_row_start + x_valid_rows, C_IN),
+                      strides=(C_IN, 1),  # C is contiguous!
+                      block_shape=(BLOCK_OW, BLOCK_K),
+                  )
+                  w_desc = tl.make_tensor_descriptor(
+                      base=w_ptr + kh * stride_wkh + kw * stride_wkw,
+                      shape=(C_IN, C_out),
+                      strides=(stride_wci, stride_wco),
+                      block_shape=(BLOCK_K, BLOCK_N),
+                  )
+                  c0 = 0
+                  for _ in range(0, C_IN, BLOCK_K):
+                      x_tile = x_desc.load([x_row_start, c0])          # out-of-bounds rows read 0
+                      w_tile = w_desc.load([c0, pid_n * BLOCK_N])
+                      acc = tl.dot(x_tile, w_tile, acc)  # → DPAS
+                      c0 += BLOCK_K
+
+          # Fused epilogue — all in registers, zero extra memory traffic
+          offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+          acc += tl.load(bias_ptr + offs_n, mask=offs_n < C_out, other=0.0)[None, :]
+          acc = tl.maximum(acc, 0.0)  # relu or other activations
+
+          # Store with boundary-limited shape to prevent oh-row wrapping
+          y_row_start = n * (OH * OW) + oh * OW + ow0
+          y_valid_rows = OW - ow0
+          y_desc = tl.make_tensor_descriptor(
+              base=y_ptr,
+              shape=(y_row_start + y_valid_rows, C_out),
+              strides=(C_out, 1),
+              block_shape=(BLOCK_OW, BLOCK_N),
+          )
+          y_desc.store([y_row_start, pid_n * BLOCK_N], acc.to(tl.float16))  # rows past OW dropped
+      ```
+
+      Grid function:
+      ```python
+      def grid(meta):
+          num_ow = triton.cdiv(OW, meta['BLOCK_OW'])
+          num_n = triton.cdiv(C_out, meta['BLOCK_N'])
+          return (N, OH, num_ow * num_n)
+      ```
+
+      Wrapper preparation (do ONCE in __init__, not per forward):
+      ```python
+      x_cl = x.to(memory_format=torch.channels_last)
+      x_nhwc = x_cl.permute(0, 2, 3, 1)  # contiguous NHWC view, no copy
+      w_hwio = weight.permute(2, 3, 1, 0).contiguous()  # [KH, KW, C_in, C_out]
+      y_cl = torch.empty(..., memory_format=torch.channels_last)
+      y_nhwc = y_cl.permute(0, 2, 3, 1)
+      ```
+
+      Key requirements:
+      - BLOCK_K must be multiple of 16 (DPAS alignment)
+      - C_IN as tl.constexpr when possible (unrolls channel reduction loop)
+      - Boundary-limited descriptor shape prevents oh-row wrapping
+      - The store offset must include ow0 (and the C_out tile): a store at a fixed
+        column makes every OW tile write the same rows
+      - Weight as HWIO (not OIHW) for direct per-(kh,kw) access
+      - For Conv3d: add outer loop over K_d, use channels_last_3d,
+        handle padding with conditional skip (d_ok, h_ok checks)
+      - For padded convolutions: padding in d/h → conditional skip,
+        padding in w → the descriptor zero-fills out-of-bounds (including negative) w
+      - Pre-allocate output as channels_last, reuse across calls
+      - Autotune BLOCK_OW, BLOCK_N, BLOCK_K, num_warps, num_stages
+
+  - id: fuse_batchnorm_into_conv_epilogue
+    name: "Fuse BatchNorm (eval mode) into conv epilogue as affine transform"
+    severity: critical
+    description: |
+      For inference/eval mode, BatchNorm reduces to an affine transform:
+        y = gamma * (x - mean) / sqrt(var + eps) + beta
+          = x * (gamma / sqrt(var + eps)) + (beta - mean * gamma / sqrt(var + eps))
+          = x * bn_scale + bn_bias
+
+      Pre-compute bn_scale and bn_bias ONCE in __init__ or a lazy cache:
+      ```python
+      inv_std = torch.rsqrt(self.bn.running_var + self.bn.eps)
+      bn_scale = (self.bn.weight * inv_std * self.scaling_factor).contiguous()
+      bn_bias = (self.bn.bias - self.bn.running_mean * self.bn.weight * inv_std).contiguous()
+      ```
+
+      Then fuse into the conv epilogue as a single multiply-add on the accumulator:
+      ```python
+      # After conv accumulation, before the output store:
+      acc += conv_bias[None, :]          # conv bias
+      acc = acc * bn_scale[None, :] + bn_bias[None, :]  # fused BN + scaling
+      y_desc.store([y_row_start, pid_n * BLOCK_N], acc.to(tl.float16))
+      ```
+
+      This eliminates a full read+write of the intermediate tensor between conv and BN.
+      The bn_scale and bn_bias vectors are [C_out] — tiny, stay in registers.
+
+  - id: use_conv_transpose_with_triton_epilogue
+    name: "Use F.conv_transpose2d/3d with Triton epilogue for transposed convolutions"
+    severity: critical
+    description: |
+      For ConvTranspose2d and ConvTranspose3d, the im2col GEMM relationship is inverted
+      (scatter instead of gather), making a custom Triton spatial-tiled kernel much harder.
+      The best approach is:
+      1. Use F.conv_transpose2d / F.conv_transpose3d for the transposed conv
+      2. Write a separate Triton elementwise kernel for the epilogue
+
+      ```python
+      def forward(self, x):
+          y = F.conv_transpose2d(x, self.weight, self.bias, stride=2, padding=1, output_padding=1)
+          return _triton_epilogue_kernel(y, ...)  # subtract, tanh, gelu, etc.
+      ```
+
+      Cache weight on XPU in __init__ to avoid per-call conversion.
+      The epilogue kernel is a simple 1D elementwise kernel — use autotune for BLOCK_SIZE.
 
   - id: fusion_register_pressure_guard
     name: "Avoid fusion that causes GRF/register pressure collapse"
@@ -101,7 +272,7 @@ patterns:
           x = tl.minimum(x, hi)
           x = tl.maximum(x, 0.0)
           tl.store(out_ptr + offsets, x, mask=mask)
-    expected_speedup: "1.2-3x (bandwidth dependent)"
+    expected_speedup: "workload-dependent (bandwidth dependent)"
     applies_to:
       - all_elementwise
       - normalization_epilogues
@@ -111,15 +282,13 @@ patterns:
     stage: fusion
     description: "Fuse activation into GEMM ONLY when you already need a custom GEMM"
     rationale: |
-      Fusion removes an intermediate write+read of the GEMM output. This can be beneficial
-      when you already use a custom GEMM kernel (special layout, custom math, no vendor path).
-      However, replacing a vendor GEMM with a custom fused GEMM for a tiny activation can be slower.
+      Fusion removes an intermediate write+read of the GEMM output. This is beneficial
+      when you use a custom GEMM kernel. Fuse the activation into the GEMM epilogue
+      by applying it on the accumulator in registers before tl.store.
     applies_when:
       - uses_custom_gemm: true
       - intermediate_materialized: true
-      - replaces_vendor_gemm: false
     rejects_when:
-      - replaces_vendor_gemm: true
       - epilogue_is_tiny: true
       - num_pid_m_le_1: true
     pattern_before: |
@@ -142,7 +311,7 @@ patterns:
           acc = tl.dot(a, b)
           acc = tl.maximum(acc, 0.0)  # ReLU
           tl.store(out_ptr + offsets, acc, mask=mask)
-    expected_speedup: "workload-dependent (positive if avoiding a large materialized intermediate; negative if replacing vendor GEMM)"
+    expected_speedup: "workload-dependent (positive if avoiding a large materialized intermediate)"
     applies_to:
       - custom_gemm_only
       - mlp
@@ -161,9 +330,7 @@ patterns:
     applies_when:
       - uses_custom_gemm: true
       - intermediate_materialized: true
-      - replaces_vendor_gemm: false
     rejects_when:
-      - replaces_vendor_gemm: true
       - activation_chain_is_heavy: true
     pattern_before: |
       c = gemm(a, b)
@@ -217,7 +384,7 @@ patterns:
       exp_x = tl.exp(x_stable)
       sum_exp = tl.sum(exp_x, axis=1, keep_dims=True)
       softmax = exp_x / sum_exp
-    expected_speedup: "1.2-3x (shape dependent)"
+    expected_speedup: "workload-dependent (shape dependent)"
     applies_to:
       - softmax
       - layernorm
@@ -252,7 +419,7 @@ patterns:
       impact is minimal and this fusion is almost always a win when you already have a
       custom GEMM kernel.
 
-      Tensor descriptors preferred on XPU; block pointers also supported.
+      Load D through a tensor descriptor with the same block shape as the output tile.
     pattern_before: |
       # Separate: GEMM then add
       c = matmul(a, b)           # writes [M, N] to memory
@@ -289,75 +456,147 @@ patterns:
       - For batched variants, create d_desc with base=d_ptr + batch_offset
       - This pattern extends to any lightweight elementwise epilogue (add, mul, clamp, relu)
         applied after the K-loop and before the store
-
-  - id: algebraic_weight_folding
-    name: "Algebraic Weight Folding (BN/scale/affine into GEMM weights)"
+  - id: fuse_gemm_activation_chain_in_registers
+    name: "Fuse multi-step activation chains after GEMM in registers"
     stage: fusion
-    description: |
-      Fold per-channel linear transforms into GEMM weights at pack time,
-      eliminating the epilogue entirely. This is the most impactful fusion
-      for kernels with BatchNorm inference, per-channel scaling, or affine transforms.
+    description: "Compute chained activations (Swish, Tanh, GELU, Hardtanh, clamp, etc.) entirely in registers on the fp32 accumulator before storing."
     rationale: |
-      BatchNorm inference is a per-channel linear operation:
-        BN(y) = gamma * (y - mean) / sqrt(var + eps) + beta
-
-      When GEMM output feeds through scaling then BN:
-        y = (x @ W^T + bias) * scale
-        output = BN(y) = gamma * (y - mean) * inv_std + beta
-
-      This entire chain is linear in W and bias. We can pre-compute:
-        alpha = gamma * scale * inv_std                           [N]
-        W_fused[n, :] = alpha[n] * W[n, :]                       [N, K]
-        b_fused[n] = alpha[n] * bias[n] - gamma[n] * inv_std[n] * mean[n] + beta[n]  [N]
-
-      The kernel becomes a pure GEMM + bias — zero epilogue overhead, zero extra
-      vector loads, maximum compute efficiency.
-    applies_when:
-      - BatchNorm or LayerNorm in inference mode (fixed running stats)
-      - Per-channel scaling (multiply by [N] vector)
-      - Any per-channel affine transform: y = a*x + b
-    rejects_when:
-      - Training mode (statistics computed per-batch, not fixed)
-      - Non-linear epilogues (sigmoid, ReLU) — cannot be folded
-      - Operations depending on the M dimension (row-wise reductions)
+      Each activation is applied to the fp32 accumulator tile already in registers.
+      No intermediate tensor is written to/from memory; the full epilogue is a single store.
+      This is always a win when the activations are cheap relative to the GEMM.
     pattern_before: |
-      # _pack_weights: just transpose
-      self.weight_t = w.to(device).t().contiguous()
-      self.bias_xpu = b.to(device)
-      self.scale_xpu = s.to(device)
-      self.gamma_xpu = gamma.to(device)
-      # ... 6 more buffers
-
-      # kernel epilogue: 6 vector loads + arithmetic
-      bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
-      acc = acc + bias[None, :]
-      scale = tl.load(scale_ptr + offs_n, mask=mask_n, other=1.0)
-      acc = acc * scale[None, :]
-      mean = tl.load(mean_ptr + offs_n, mask=mask_n, other=0.0)
-      var = tl.load(var_ptr + offs_n, mask=mask_n, other=1.0)
-      gamma = tl.load(gamma_ptr + offs_n, mask=mask_n, other=1.0)
-      beta = tl.load(beta_ptr + offs_n, mask=mask_n, other=0.0)
-      inv_std = 1.0 / tl.sqrt(var + eps)
-      acc = (acc - mean[None, :]) * inv_std[None, :]
-      acc = acc * gamma[None, :] + beta[None, :]
+      # Separate kernels
+      out1 = gemm_kernel(x, w, bias)      # writes [M,N] to HBM
+      out2 = swish_kernel(out1)            # reads/writes [M,N]
+      out3 = tanh_kernel(out2)             # reads/writes [M,N]
+      out4 = gelu_kernel(out3)             # reads/writes [M,N]
+      out5 = hardtanh_kernel(out4)         # reads/writes [M,N]
     pattern_after: |
-      # _pack_weights: fold BN + scale into weights (one-time cost)
-      inv_std = 1.0 / torch.sqrt(rv + self.eps)
-      alpha = gamma * s * inv_std
-      w_fused = alpha.unsqueeze(1) * w
-      b_fused = alpha * b - gamma * inv_std * rm + beta
-      self.weight_t = w_fused.to(device).t().contiguous().to(torch.bfloat16)
-      self.bias_fused = b_fused.to(device)
-
-      # kernel epilogue: just bias add (everything else is folded)
-      bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
-      acc = acc + bias[None, :]
-    expected_speedup: "1.5-2x on top of Level 1 optimizations (eliminates epilogue entirely)"
-    applies_to:
-      - gemm
-      - batchnorm
-      - inference
-      - mlp
+      # Everything in the GEMM epilogue (fp32 acc)
+      # --- Swish: x * sigmoid(x) ---
+      sigmoid = 1.0 / (1.0 + tl.exp(-acc))
+      acc = acc * sigmoid
+      # --- Divide ---
+      acc = acc * 0.5
+      # --- Clamp [-1, 1] ---
+      acc = tl.maximum(acc, -1.0)
+      acc = tl.minimum(acc, 1.0)
+      # --- Tanh via exp ---
+      exp_2x = tl.exp(2.0 * acc)
+      acc = (exp_2x - 1.0) / (exp_2x + 1.0)
+      # --- Final clamp (Hardtanh) ---
+      acc = tl.maximum(acc, -1.0)
+      acc = tl.minimum(acc, 1.0)
+      # Single fp16 store
+      c_desc.store([off_m, off_n], acc.to(tl.float16))
     examples:
-      - file: test_kernels/39_Gemm_Scale_BatchNorm_triton.py
-        description: "Folds Linear + Scale + BatchNorm into pure GEMM. Level 1: 2.69x → Level 3: 5.28x"
+      - file: 81_Gemm_Swish_Divide_Clamp_Tanh_Clamp.py
+        note: "Swish -> /2 -> clamp -> tanh -> clamp fused into one GEMM epilogue"
+      - file: 95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py
+        note: "Four activation stages fused with bias-add and residual-add"
+
+  - id: fuse_gemm_batchnorm_scale_inference
+    name: "Fuse GEMM + BatchNorm (inference) + Scale into one kernel"
+    stage: fusion
+    description: "Apply BatchNorm normalization and a scalar scale in the GEMM epilogue using precomputed running mean/variance."
+    rationale: |
+      At inference, BatchNorm reduces to a per-channel affine: (x - mean) / sqrt(var + eps) * gamma + beta.
+      All per-column stats (rm, rv, gamma, beta, scale) are 1D vectors loaded once per tile column and
+      broadcast across the BLOCK_M rows — zero extra memory passes over the [M,N] data.
+    pattern_before: |
+      out_gemm = gemm(x, w, bias)          # [M, N] to HBM
+      out_bn   = batchnorm(out_gemm, ...)  # reads [M, N]
+      out      = out_bn * scale            # reads [M, N]
+    pattern_after: |
+      # In epilogue after K-loop (column stats loaded once per tile)
+      offs_n  = col_start + tl.arange(0, BLOCK_N)
+      mask_n  = offs_n < N
+      rm      = tl.load(rm_ptr    + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+      rv      = tl.load(rv_ptr    + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+      g       = tl.load(gamma_ptr + offs_n, mask=mask_n, other=1.0).to(tl.float32)
+      be      = tl.load(beta_ptr  + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+      invstd  = 1.0 / tl.sqrt(rv + EPS)
+      acc = (acc - rm[None, :]) * invstd[None, :] * g[None, :] + be[None, :]
+      s   = tl.load(scale_ptr).to(tl.float32)
+      acc = acc * s
+      out_desc.store([row_start, col_start], acc.to(tl.float16))
+    examples:
+      - file: 39_Gemm_Scale_BatchNorm.py
+        note: "4096x4096 GEMM fused with inference BN and per-channel scale"
+      - file: 84_Gemm_BatchNorm_Scaling_Softmax.py
+        note: "GEMM + BN + Scale followed by 2D-tiled Softmax as a separate kernel"
+
+  - id: fuse_gemm_min_subtract_epilogue
+    name: "Fuse GEMM + min-clamp + subtract as epilogue"
+    stage: fusion
+    description: "Apply tl.minimum and scalar subtraction to the fp32 accumulator before store."
+    rationale: |
+      min() and subtract are element-wise ops on the GEMM tile already in registers.
+      Fusing eliminates a full [M,N] memory round-trip at essentially zero extra cost.
+    pattern_before: |
+      out = gemm(x, w, bias)
+      out = torch.minimum(out, constant)
+      out = out - constant
+    pattern_after: |
+      # Epilogue after K-loop
+      acc = tl.minimum(acc, constant)
+      acc = acc - constant
+      o_desc.store([off_m, off_n], acc.to(tl.float16))
+    examples:
+      - file: 68_Matmul_Min_Subtract.py
+        note: "min(GEMM+bias, C) - C fused; constant passed as Python float to avoid device sync"
+
+  - id: fuse_gemm_reduction_epilogue_with_atomics
+    name: "Fuse GEMM tile + reduction (maxpool/sum/scale) using atomic adds"
+    stage: fusion
+    description: "Perform pairwise max-pool and row-sum reduction on each GEMM tile in-register, then atomic-add into a [M] output."
+    rationale: |
+      For workloads that ultimately reduce over N (pool → sum → scale), fusing the reduction
+      into the GEMM kernel eliminates the [M,N] intermediate entirely. Each tile computes
+      its partial row sum and atomically accumulates into the [M] output buffer.
+      Requires pre-zeroed output (torch.zeros) for atomic safety.
+    pattern_before: |
+      logits = gemm(x, w, bias)          # [M, N] to HBM
+      pooled = maxpool1d(logits, k=2)    # [M, N/2]
+      sums   = pooled.sum(dim=1)         # [M]
+      out    = sums * scale
+    pattern_after: |
+      # In kernel epilogue (per tile):
+      acc_pairs = tl.reshape(acc, (BLOCK_M, BLOCK_N // 2, 2))
+      pair_max  = tl.max(acc_pairs, axis=2)          # [BM, BN/2]
+      row_sum   = tl.sum(pair_max, axis=1)           # [BM]
+      row_sum   = row_sum * scale
+      # Atomic accumulate (requires pre-zeroed output)
+      out_acc   = torch.zeros((M,), device='xpu', dtype=torch.float32)
+      tl.atomic_add(out_ptrs, row_sum, mask=mask_m)
+    examples:
+      - file: 55_Matmul_MaxPool_Sum_Scale.py
+        note: "Full GEMM+bias+maxpool(k=2)+sum+scale fused; output pre-zeroed for atomic safety"
+
+  - id: split_lse_into_separate_reduction_kernel
+    name: "Split LogSumExp/Softmax into a dedicated reduction kernel"
+    stage: fusion
+    description: "Do NOT fuse row-wise LogSumExp or Softmax into the GEMM kernel when the GEMM parallelism would be lost."
+    rationale: |
+      LogSumExp/Softmax requires a full-row scan which conflicts with 2D GEMM tile parallelism.
+      Fusing it forces serialization over N inside the GEMM tile.
+      Better: GEMM writes logits to HBM, then a separate row-reduction kernel reads them once.
+      The memory round-trip is accepted because it preserves M*N parallelism in the GEMM.
+    pattern_before: |
+      # Trying to fuse LSE inside GEMM kernel — serializes N scan
+      @triton.jit
+      def bad_fused_gemm_lse_kernel(...):
+          # K-loop for GEMM
+          for k in ...: ...
+          # Then full-row reduction — needs all N columns, breaks tile parallelism
+          row_max = tl.max(acc, axis=1)  # works only if full row fits in one tile
+    pattern_after: |
+      # Kernel 1: GEMM + sigmoid (2D parallel)
+      gemm_bias_sigmoid_kernel[grid2d](A, Wt, bias1, inter, ...)
+      # Kernel 2: GEMM (2D parallel)
+      gemm_bias_kernel[grid2d](inter, W2t, bias2, logits, ...)
+      # Kernel 3: LogSumExp (row-wise reduction)
+      lse_kernel[grid_rows](logits, lse_out, ...)
+    examples:
+      - file: 45_Gemm_Sigmoid_LogSumExp.py
+        note: "Two GEMM kernels + separate LSE reduction; 2D-parallel GEMM + 1D LSE kernel"

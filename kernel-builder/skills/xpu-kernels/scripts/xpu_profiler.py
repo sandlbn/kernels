@@ -727,7 +727,7 @@ def print_recommendations(
 
         # --- High LSC->L3 miss: L1 thrashing ---
         # Grounded in: references/xpu_optimizations.yaml (xpu_descriptor_gemm_pattern)
-        # and references/memory_patterns.yaml (mem_block_pointers)
+        # and references/memory_patterns.yaml (mem_tensor_descriptors)
         if lsc_l3_miss is not None and lsc_l3_miss > 50:
             recommendations.append(
                 (
@@ -735,7 +735,7 @@ def print_recommendations(
                     "Use tensor descriptors for structured access patterns. "
                     "Ensure coalesced access within work groups.",
                     "references/xpu_optimizations.yaml (xpu_descriptor_gemm_pattern) + "
-                    "references/memory_patterns.yaml (mem_block_pointers)",
+                    "references/memory_patterns.yaml (mem_tensor_descriptors)",
                 )
             )
 

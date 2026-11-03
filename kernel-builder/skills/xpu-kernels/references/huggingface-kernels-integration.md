@@ -220,7 +220,8 @@ Not all Hub kernels have XPU builds:
 | Kernel Type | XPU Support | Notes |
 |-------------|:----------:|-------|
 | Triton-based (e.g., `triton-layer-norm`) | Likely | Triton compiles via Intel XPU backend |
-| CUDA C-based (e.g., `flash-attn`) | Check | Needs explicit XPU build |
+| SYCL / SYCL-TLA (`cpp-xpu`) | Yes | Built per XPU Torch variant by kernel-builder |
+| CUDA C-based (e.g., `flash-attn`) | Check | Needs explicit XPU (SYCL) build |
 | Custom CUDA ops | Unlikely | CUDA-only unless ported |
 
 **Always check availability first:**
@@ -261,46 +262,89 @@ print(f"GPU: {torch.xpu.get_device_name()}")
 
 ## Publishing Kernels to Hub
 
-### Triton Kernel Project Structure
+Scaffold with `kernel-builder init --name your-org/your-kernel --backends xpu`, then replace
+the stub sources. The layout depends on the kernel's language.
 
-For Triton-based kernels (best XPU compatibility):
+### Triton kernels (`torch-noarch`)
+
+Triton kernels are JIT-compiled, so they ship as a Python package without an AOT build
+section (see `examples/kernels/relu-triton` in the kernels repository):
 
 ```
 my-triton-kernel/
 ├── build.toml
-├── kernel_src/
-│   └── rmsnorm.py          # Triton kernel source
+├── tests/
 └── torch-ext/
-    ├── torch_binding.cpp
-    └── my_kernels/
-        └── __init__.py
+    └── my_triton_kernel/
+        ├── __init__.py      # public API
+        └── op.py            # @triton.jit kernels + launchers
 ```
-
-### build.toml for Triton Kernels
 
 ```toml
 [general]
-name = "my_triton_kernels"
-backends = ["cuda", "xpu"]    # Include XPU backend
+name = "my-triton-kernel"     # dash-separated
+version = 1
+license = "Apache-2.0"
+backends = ["cuda", "rocm", "xpu"]
+
+[general.hub]
+repo-id = "your-org/my-triton-kernel"
+
+[torch-noarch]
+# pyext = ["py", "json"]     # e.g. to ship Triton autotune configs
+```
+
+### SYCL and SYCL-TLA kernels (`cpp-xpu`)
+
+AOT-compiled for every XPU Torch variant (see `examples/kernels/relu` and
+`examples/kernels/cutlass-gemm`):
+
+```
+my-sycl-kernel/
+├── build.toml
+├── rmsnorm_xpu/
+│   └── rmsnorm.cpp          # SYCL / SYCL-TLA device + host code
+├── tests/
+└── torch-ext/
+    ├── torch_binding.cpp    # TORCH_LIBRARY_EXPAND registration (torch::kXPU)
+    ├── torch_binding.h
+    └── my_sycl_kernel/
+        └── __init__.py
+```
+
+```toml
+[general]
+name = "my-sycl-kernel"
+version = 1
+license = "Apache-2.0"
+backends = ["xpu"]
+
+[general.hub]
+repo-id = "your-org/my-sycl-kernel"
 
 [torch]
-src = ["torch-ext/torch_binding.cpp"]
+src = ["torch-ext/torch_binding.cpp", "torch-ext/torch_binding.h"]
 
-[kernel.rmsnorm]
-backend = "triton"
-src = ["kernel_src/rmsnorm.py"]
-depends = ["torch"]
+[kernel.rmsnorm_xpu]
+language = "cpp-xpu"
+depends = ["torch"]          # add "sycl_tla" for SYCL-TLA / CuTe kernels
+src = ["rmsnorm_xpu/rmsnorm.cpp"]
 ```
+
+Binding template and porting checklist: `references/sycl/sycl-implementation.md`.
 
 ### Build and Publish
 
 ```bash
-pip install kernel-builder
-kernel-builder build
+# The kernel directory must be a git repository (Nix only sees tracked files)
+nix run .#build-and-copy -L        # or: kernel-builder build
+nix run .#ci-test                  # run the kernel's tests for the built variants
 
-huggingface-cli repo create your-org/your-kernel --type model
-huggingface-cli upload your-org/your-kernel ./dist
+# Build and upload to the Hub repo set by [general.hub] repo-id
+kernel-builder build-and-upload
 ```
+
+Uploads go to a **kernel**-type Hub repository; the owning user/org needs kernel-creation access.
 
 ### Others Load It
 
@@ -337,7 +381,7 @@ kernel = get_kernel("kernels-community/triton-layer-norm")
 
 1. **Always check availability** — `has_kernel()` before `get_kernel()`
 2. **Pin versions** — `get_kernel(repo, version=1)` for reproducibility
-3. **Have a fallback** — local Triton kernel when Hub build is unavailable
+3. **Have a fallback** — local Triton kernel or PyTorch path when a Hub build is unavailable
 4. **Use lockfiles in production** — `load_kernel("kernel.lock")`
 5. **Test on your GPU** — verify correctness after loading
 

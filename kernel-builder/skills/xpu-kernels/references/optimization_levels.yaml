@@ -4,10 +4,9 @@
 # check the "try harder" decision tree to decide whether deeper optimization
 # is warranted. Most production kernels should reach at least Level 2.
 #
-# Case study: kernel #39 (Gemm_Scale_BatchNorm)
-#   Level 1 alone: 2.69x speedup (tensor descriptors, tile swizzling, fused epilogue)
-#   Level 2 + 3:   5.28x speedup (bf16 pre-pack, BN folded into weights)
-#   See: test_kernels/39_Gemm_Scale_BatchNorm_triton.py
+# Case study: KernelBench Level 2 #39 (Gemm_Scale_BatchNorm) — Level 1 (tensor
+# descriptors, tile swizzling, fused epilogue) helped; Levels 2 + 3 (bf16 pre-pack,
+# BN folded into weights) helped further. Measure your own kernel at every level.
 
 levels:
   - id: level_1_baseline_xpu
@@ -16,21 +15,20 @@ levels:
       Get the kernel working with standard XPU patterns. This is the minimum
       viable optimization — necessary but rarely sufficient for production.
     checklist:
-      - Tensor descriptors (preferred on XPU) or block pointers (not manual pointer arithmetic)
+      - Tensor descriptors (tl.make_tensor_descriptor), not manual pointer arithmetic; tl.make_block_ptr is deprecated
       - bf16/fp16 dot inputs, fp32 accumulator
       - 1D grid with tile swizzling (GROUP_SIZE_M) for GEMM kernels
       - "@triton.autotune with XPU-optimized configs"
       - Pre-packed weight transpose cached in _pack_weights()
       - Fused light epilogues (bias, simple activations)
-      - Correct boundary_check=(0, 1) for block pointers (tensor descriptors handle boundaries internally); no default block params
-    typical_speedup: "1.5-3x vs PyTorch"
+      - No boundary_check on descriptor loads (descriptors handle boundaries internally); no default block params
     when_done: "Move to Level 2 — there is almost always more to gain."
 
   - id: level_2_bandwidth_reduction
     name: "Level 2: Bandwidth Reduction"
     description: |
       Reduce memory bandwidth consumption — the most common bottleneck after
-      Level 1. Loading fp32 data and converting in-kernel wastes 2x bandwidth.
+      Level 1. Loading fp32 data and converting in-kernel moves twice the bytes of bf16.
     checklist:
       - "Pre-pack weights to bf16 at pack time (not in-kernel conversion)"
       - "Pre-convert inputs to bf16 before kernel launch: x.to(device, torch.bfloat16)"
@@ -45,7 +43,6 @@ levels:
       # AFTER (Level 2 — halves K-loop memory traffic):
       self.weight_t = w.to(device).t().contiguous().to(torch.bfloat16)  # bf16
       # kernel: a = tl.load(ptr)                               # loads 2B directly
-    typical_speedup: "2-4x vs PyTorch"
     when_done: |
       Check Level 3 — if the epilogue contains linear transforms (BN, scale,
       affine), they can often be eliminated entirely.
@@ -80,21 +77,20 @@ levels:
       - "BatchNorm in training mode (statistics are computed per-batch)"
       - "Non-linear epilogues (sigmoid, ReLU, etc.) — these cannot be folded"
       - "Operations that depend on the M dimension (row-wise reductions)"
-    typical_speedup: "3-6x vs PyTorch"
     when_done: |
       For most kernels, this is sufficient. Move to Level 4 only for
       critical-path kernels where profiling shows remaining bottlenecks.
     example:
-      file: test_kernels/39_Gemm_Scale_BatchNorm_triton.py
+      file: "KernelBench Level 2 #39 (Gemm_Scale_BatchNorm)"
       description: |
         Kernel #39 folds Linear + Scale + BatchNorm into a pure GEMM.
-        Before (Level 1): 6 vector loads + arithmetic in epilogue → 2.69x
-        After  (Level 3): zero epilogue, pure GEMM + bias → 5.28x
+        Before (Level 1): vector loads + arithmetic in the epilogue
+        After  (Level 3): no epilogue, pure GEMM + bias
 
   - id: level_4_expert
     name: "Level 4: Expert Techniques"
     description: |
-      Advanced patterns for squeezing the last 10-30% of performance.
+      Advanced patterns for squeezing out remaining performance.
       Only pursue these for critical-path kernels after profiling confirms
       the bottleneck. These techniques increase code complexity significantly.
     checklist:
@@ -105,11 +101,9 @@ levels:
       - Shape-specific specialization (skip boundary checks when M % BLOCK_M == 0)
       - Atomic partial tile accumulation
       - Adaptive grid layouts (small vs large workloads)
-    typical_speedup: "5-10x+ vs PyTorch (shape-dependent)"
     when_done: "Benchmark shows no further improvement — try a fundamentally different approach."
     reference_files:
-      - kb/persistent_kernel_patterns.yaml
-      - kb/examples/stream_k_gemm_descriptors.py
+      - references/persistent_kernel_patterns.yaml
 
 
 # ============================================================================
@@ -124,12 +118,12 @@ try_harder:
     (algebraic fusion). Level 4 has diminishing returns for most workloads.
 
   decisions:
-    - condition: "Speedup < 2x after Level 1"
-      diagnosis: "Likely bandwidth-bound — loading fp32 and converting wastes 2x BW"
-      action: "Apply Level 2: pre-pack to bf16, add grf_mode='large'. Run 'python skills/xpu_profiler.py' to confirm bandwidth bottleneck (look for high XVE Stalled %)."
+    - condition: "Small gain after Level 1"
+      diagnosis: "Possibly bandwidth-bound — loading fp32 and converting moves twice the bytes of bf16"
+      action: "Apply Level 2: pre-pack to bf16, add grf_mode='large'. Run 'python scripts/xpu_profiler.py' to confirm bandwidth bottleneck (look for high XVE Stalled %)."
       priority: high
 
-    - condition: "Speedup 2-3x after Level 2"
+    - condition: "Gain after Level 2, epilogue still non-trivial"
       diagnosis: "Epilogue may be adding unnecessary work"
       action: |
         Check: does the epilogue contain only linear per-channel transforms?
@@ -138,17 +132,17 @@ try_harder:
         Consider Level 4 techniques or accept current speedup.
       priority: high
 
-    - condition: "Speedup 3-5x after Level 3"
-      diagnosis: "Good performance — likely near hardware limits for this shape"
+    - condition: "Gains flatten after Level 3"
+      diagnosis: "Check the profile; the remaining bottleneck decides the next step"
       action: |
-        Run 'python skills/xpu_profiler.py' to identify remaining bottleneck.
+        Run 'python scripts/xpu_profiler.py' to identify remaining bottleneck.
         If compute-bound (XVE Active > Stalled) → try larger tiles or Stream K.
         If memory-bound (XVE Stalled > Active) → check for unnecessary copies or layout transforms.
         Keep going — try a different approach if current strategy has plateaued.
       priority: medium
 
-    - condition: "Speedup > 5x"
-      diagnosis: "Excellent — diminishing returns ahead"
+    - condition: "Speedup above the early-stop threshold in SKILL.md"
+      diagnosis: "Stop condition reached"
       action: "Stop unless this kernel is on the critical path. Focus effort elsewhere."
       priority: low
 
@@ -157,5 +151,5 @@ try_harder:
       action: |
         Check for: fp64 usage, N-loop serialization, missing tile swizzling,
         very small tiles, or replacing a fast vendor GEMM with a slow custom one.
-        Re-read kb/correctness.yaml and kb/fusion_patterns.yaml constraints.
+        Re-read references/correctness.yaml and references/fusion_patterns.yaml constraints.
       priority: critical

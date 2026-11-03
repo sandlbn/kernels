@@ -6,7 +6,7 @@
 # - there are many tiles (launch/tail overhead),
 # - the workload is bandwidth/reduction bound,
 # - cache reuse across tiles is valuable,
-# and they do NOT replace a faster vendor primitive (e.g., vendor GEMM).
+# and the workload benefits from persistent scheduling.
 #
 # Stream K is a related advanced scheduling strategy that splits tiles'
 # K-loop iterations evenly across programs to fix quantization inefficiency.
@@ -58,7 +58,7 @@ patterns:
               ...
 
               tile += NUM_PROGS
-    expected_speedup: "0.8-2.0x (highly shape/workload dependent; can regress)"
+    expected_speedup: "workload-dependent (highly shape/workload dependent; can regress)"
     applies_to:
       - gemm
       - attention
@@ -202,3 +202,43 @@ patterns:
     notes: |
       - The while loop handles programs that span multiple tiles
       - end_iter snaps to tile boundaries within the assigned range
+constraints:
+
+  - id: persistent_kernel_minimum_grid_threshold
+    name: "Do NOT apply persistent kernel when the grid does not exceed the device's parallel capacity"
+    severity: critical
+    description: |
+      Persistent kernels only help when the grid is large enough that:
+        (a) launch/scheduling overhead is measurable, AND
+        (b) tail quantization wastes significant EU time.
+
+      Derive the device's parallel capacity from the queried properties
+      (scripts/xpu_device_info.py: gpu_subslice_count, gpu_eu_count) — never from a
+      remembered EU count. If the number of tiles does not clearly exceed what the
+      device runs concurrently, a persistent kernel adds complexity with no benefit:
+      the hardware is not even fully utilized in the first pass.
+
+      SKIP persistent kernel transform when ANY of these are true:
+        - num_tiles = cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N) does not clearly exceed
+          the device's concurrent capacity
+        - The kernel is a 1D reduction (output shape [M] or [M,1]) — these
+          already have M programs, not M*N tile programs
+        - M is small (the grid is inherently tiny)
+        - The kernel is not a custom GEMM (e.g., uses F.linear for the matmul)
+
+      For this to apply, the kernel must be a large 2D GEMM-like workload with
+      many tiles per dimension at the chosen BLOCK_M / BLOCK_N. Benchmark both forms.
+
+  - id: persistent_kernel_not_for_reduction_outputs
+    name: "Do NOT apply persistent kernel to reduction kernels (output [M] or [M,1])"
+    severity: critical
+    description: |
+      Persistent kernels target 2D tile grids (GEMM, attention) where work is
+      tiled in both M and N dimensions. Reduction kernels that produce [M] or
+      [M,1] outputs are 1D grids — each program handles one row.
+
+      Applying persistence to a 1D reduction grid creates unnecessary complexity
+      and does not improve throughput.
+
+      If the kernel output shape collapses N to 1 (e.g. row-wise sum, dot product,
+      LogSumExp, softmax denominator), do NOT flag missing_persistent.

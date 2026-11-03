@@ -1,0 +1,57 @@
+constraints:
+- id: outputs_must_match
+  name: Preserve the reference computation and interface
+  severity: critical
+  description: |
+    Preserve required output values, shapes, dtypes, devices, container structure,
+    and any specified layout, aliasing or mutation behavior. Match the workload's
+    numerical contract, including tolerances and handling of special values.
+    Validate every candidate before accepting its timing. A passing check on one
+    input is not proof for other supported shapes, strides, dtypes or edge cases.
+    Do not relax tolerances or change the reference to make an optimization pass.
+
+- id: kernel_launch_must_use_device_moved_tensors
+  name: Launch with the actual prepared tensors and their metadata
+  severity: critical
+  description: |
+    When preparation creates a converted or contiguous tensor, pass that tensor
+    to the kernel and derive strides, dtype and other addressing metadata from it.
+    Do not combine a copied tensor's pointer with the original tensor's strides.
+    Check the exact device, including its index, against the launch context and
+    the kernel's memory-access requirements. Keep operands alive until asynchronous
+    work completes and respect the caller's stream or queue ordering.
+
+- id: preserve_input_precision
+  name: Convert dtype or layout only when the workload permits it
+  severity: critical
+  description: |
+    Do not force inputs, weights or outputs to a preferred dtype merely because
+    it is faster. Input, accumulation and output precision are separate choices;
+    each must satisfy the reference contract. Preserve required intermediate
+    rounding when fusing operations. Respect noncontiguous inputs or provide a
+    correct conversion path whose cost is included in the measured operation.
+    Combining device and dtype conversion can be an optimization, but separate
+    conversions are not inherently incorrect. Measure the relevant execution path.
+
+- id: respect_workload_preparation
+  name: Follow the harness ownership of model and input preparation
+  severity: critical
+  description: |
+    Inspect the active harness before adding device transfers inside forward().
+    KernelBench-style harnesses (including scripts/benchmark.py) move the model
+    and tensor inputs to the configured device; other harnesses may differ.
+    Use registered parameters and buffers for model state that must follow module
+    conversions; ordinary tensor attributes do not automatically follow them.
+    Do not mutate parameter .data to repair placement during execution. Preserve
+    parameter identity and any required gradient or optimizer behavior. Additional
+    preparation and cache invalidation must follow the workload's lifecycle.
+
+- id: preserve_output_placement
+  name: Return outputs on the device required by the interface
+  severity: critical
+  description: |
+    Keep device-resident outputs on the required device when that is the contract.
+    Do not add .cpu(), a device transfer or a dtype conversion to the return path
+    unless the reference interface requires it. Conversely, do not change a
+    required host output into a device output simply to improve kernel timing.
+    Include required output conversion and transfer costs in the benchmark scope.

@@ -133,7 +133,8 @@ def validate_triton_kernel(filepath: Path) -> List[ValidationError]:
             errors.append(
                 ValidationError(
                     "WARNING",
-                    "float64 detected. This is 5-10x slower on XPU. Use float32 unless absolutely required.",
+                    "float64 detected. float64 is much slower than float32 on XPU (check has_fp64 in "
+                    "scripts/xpu_device_info.py). Use float32 unless absolutely required.",
                     i + 1,
                 )
             )
@@ -166,18 +167,20 @@ def validate_triton_kernel(filepath: Path) -> List[ValidationError]:
                     )
                 )
 
-    # 7. Check for mixed block pointer and tensor descriptor APIs
-    has_block_ptr = "make_block_ptr" in source
+    # 7. Deprecated block pointer API (see references/xpu_optimizations.yaml,
+    #    deprecated_block_ptr_use_tensor_descriptors)
     has_tensor_desc = "make_tensor_descriptor" in source
-    if has_block_ptr and has_tensor_desc:
-        errors.append(
-            ValidationError(
-                "INFO",
-                "Both block pointers and tensor descriptors found. This is OK if used for "
-                "different operations (e.g., descriptors for loads, manual pointers for atomics). "
-                "But do NOT mix APIs for the same load/store operation.",
+    for i, line in enumerate(lines):
+        if "tl.make_block_ptr" in line or "tl.advance(" in line:
+            errors.append(
+                ValidationError(
+                    "WARNING",
+                    "tl.make_block_ptr / tl.advance are deprecated. Use tl.make_tensor_descriptor "
+                    "and desc.load/desc.store at explicit offsets.",
+                    i + 1,
+                )
             )
-        )
+            break
 
     # 8. Check for .item() or device-to-host sync in hot path
     for i, line in enumerate(lines):
@@ -266,12 +269,8 @@ def validate_triton_kernel(filepath: Path) -> List[ValidationError]:
         errors.append(ValidationError("INFO", "No critical issues found! ✓"))
 
     # Positive feedback for good patterns
-    if has_block_ptr or has_tensor_desc:
-        errors.append(
-            ValidationError(
-                "INFO", "✓ Using modern memory access API (block pointers or tensor descriptors)"
-            )
-        )
+    if has_tensor_desc:
+        errors.append(ValidationError("INFO", "✓ Using tensor descriptors"))
     if "bfloat16" in source or "float16" in source:
         errors.append(ValidationError("INFO", "✓ Using reduced precision inputs (bf16/fp16)"))
     if "float32" in source and "accumulator" in source.lower():

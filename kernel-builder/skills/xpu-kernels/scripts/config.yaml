@@ -2,3 +2,5 @@
 max_trials: 10             # Maximum number of optimization trials (3-20)
 vtune_enabled: true        # Set to false to skip VTune profiling entirely
 vtune_bin: "/bin64/vtune"  # Path to VTune binary
+unitrace_enabled: false    # Set to true to profile with unitrace (preferred for SYCL when available)
+unitrace_bin: "unitrace"   # Path to unitrace binary (Intel PTI)

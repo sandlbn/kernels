@@ -103,6 +103,8 @@ Use this skill when:
 | Large BF16/FP16 GEMM, grouped/MoE GEMM, W4A16/W8A16 GEMM | **SYCL-TLA** | Library DPAS mainloops, 2D block copies, Stream-K / group schedulers |
 | Flash attention (prefill/decode/paged) | **Triton** or **SYCL-TLA** | Triton for broad shape sets; SYCL-TLA FA2 collectives for fixed head dims |
 | Explicit sub-group / SLM control, existing SYCL code base | **SYCL** | Direct `nd_range`, sub-group collectives, `local_accessor` |
+| Hand-tuned SYCL-TLA kernel: custom fusion, unusual tiling, atom-level control | **SYCL-TLA (CuTe)** | See [references/sycl/tla-cute-xe/README.md](references/sycl/tla-cute-xe/README.md) for the atom/K-loop level, below the `CollectiveBuilder` API |
+| GEMM/attention where no SYCL-TLA collective fits (unsupported dtype combo, custom accumulator chaining) | **SYCL + raw DPAS intrinsics** | See [references/sycl/dpas-gemm/README.md](references/sycl/dpas-gemm/README.md) for SPIR-V intrinsics, register layouts, tiling and debugging |
 
 You can mix: e.g. a SYCL-TLA GEMM followed by a Triton reduction. Keep each trial a single
 self-contained file.

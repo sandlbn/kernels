@@ -22,6 +22,9 @@ Companion knowledge base:
 | [cutlass_sycl_framework.yaml](cutlass_sycl_framework.yaml) | SYCL-TLA tile configurations, dispatch policies, tile schedulers, epilogue fusion catalog, fused-kernel patterns (dual GEMM, FA2, MoE grouped GEMM) |
 | [resource_feedback.yaml](resource_feedback.yaml) | How to read unitrace kernel properties (SIMD, SLM, private/spill memory, register file) |
 | [compute_basic.yaml](compute_basic.yaml) | unitrace ComputeBasic / EU-stall collection and interpretation |
+| [dpas-gemm/README.md](dpas-gemm/README.md) | Raw DPAS/SPIR-V intrinsics GEMM — register layouts, operand flags, tiling, debugging wrong results. Use when no SYCL-TLA collective fits |
+| [tla-gemm/README.md](tla-gemm/README.md) | SYCL-TLA as a header library in your own app: `CollectiveBuilder` composition, build/link flags (incl. the required `SPV_INTEL_split_barrier`), CMake, epilogue fusion ops |
+| [tla-cute-xe/README.md](tla-cute-xe/README.md) | Hand-written CuTe kernels: MMA/copy atoms, `TiledMMAHelper`, the prefetch/load/reorder/gemm K-loop, launch properties |
 | [../common/correctness.yaml](../common/correctness.yaml) | DSL-independent correctness rules (shared with Triton) |
 | [../common/algorithmic_patterns.yaml](../common/algorithmic_patterns.yaml) | DSL-independent algorithmic rewrites |
 
@@ -34,10 +37,13 @@ Companion knowledge base:
 | Elementwise, activation, normalization, reductions, softmax, RoPE, gather/scatter | Plain SYCL (`nd_range` + subgroup/work-group collectives) |
 | GEMM, batched/grouped GEMM, GEMM + epilogue, MoE GEMM, quantized (W4A16/W8A16) GEMM | SYCL-TLA collectives (`CollectiveMma` + Xe epilogue) |
 | Attention (prefill/decode, paged, chunked) | SYCL-TLA flash-attention collectives, or Triton if the shape set is broad |
-| Anything where XMX/DPAS is needed but SYCL-TLA has no fitting collective | `sycl::ext::oneapi::experimental::matrix::joint_matrix` (verify the supported combination first — `sycl_joint_matrix_gemm`) |
+| Anything where XMX/DPAS is needed but SYCL-TLA has no fitting collective | `sycl::ext::oneapi::experimental::matrix::joint_matrix` (verify the supported combination first — `sycl_joint_matrix_gemm`), or raw DPAS/SPIR-V intrinsics — see [dpas-gemm/README.md](dpas-gemm/README.md) |
+| Hand-written CuTe kernel below the `CollectiveBuilder` level (custom fusion, unusual tiling) | SYCL-TLA atoms/`TiledMMAHelper` — see [tla-cute-xe/README.md](tla-cute-xe/README.md) |
 
 Do not hand-roll a DPAS GEMM in plain SYCL when a SYCL-TLA collective fits; the library
 encodes the legal atom/copy/layout combinations (`sycl_dpas_tile_shapes_per_generation`).
+Integrating SYCL-TLA as a header library in your own app (build flags, CMake,
+`CollectiveBuilder` composition): [tla-gemm/README.md](tla-gemm/README.md).
 
 ---
 

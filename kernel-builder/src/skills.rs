@@ -18,6 +18,7 @@ pub enum SkillId {
     RocmKernels,
     TritonKernels,
     XpuKernels,
+    OpenclKernels,
 }
 
 impl SkillId {
@@ -28,6 +29,7 @@ impl SkillId {
             SkillId::RocmKernels => "rocm-kernels",
             SkillId::TritonKernels => "triton-kernels",
             SkillId::XpuKernels => "xpu-kernels",
+            SkillId::OpenclKernels => "opencl-kernels",
         }
     }
 }

@@ -1,0 +1,8 @@
+# Files for opencl-kernels skill
+SKILL.md
+references/architecture.md
+references/gemm-dpas-reference.md
+references/gemm-reference.md
+references/gemm.md
+references/split-workgroup-barrier-extension.md
+references/split-workgroup-barrier.md

@@ -5,6 +5,7 @@ Supported skills include:
 - `cuda-kernels` (default)
 - `rocm-kernels`
 - `xpu-kernels`
+- `opencl-kernels`
 - `cpu-kernels`
 - `triton-kernels`
 
